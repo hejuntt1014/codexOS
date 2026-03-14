@@ -11,6 +11,9 @@ pub mod memory;
 #[path = "../../../kernel/src/vm.rs"]
 pub mod vm;
 
+#[path = "../../../kernel/src/interrupts.rs"]
+pub mod interrupts;
+
 #[path = "../../../kernel/src/boot.rs"]
 pub mod boot;
 
@@ -20,6 +23,11 @@ use bootinfo::{BootInfo, FirmwareMode};
 pub fn init(boot_info: &BootInfo) {
     serial::init();
     memory::init(boot_info);
+    let idt_loaded = if matches!(boot_info.firmware_mode, FirmwareMode::PostExitBootServices) {
+        interrupts::init_idt()
+    } else {
+        false
+    };
     boot::record_firmware_entry();
     log_line(format_args!("codexOS kernel entered"));
     log_line(format_args!(
@@ -51,6 +59,22 @@ pub fn init(boot_info: &BootInfo) {
         stats.remaining_pages,
         memory::first_usable_kind().as_str()
     ));
+    let interrupt_status = interrupts::status();
+    log_line(format_args!(
+        "interrupts: idt={} hw={} ticks={} hz={}",
+        if idt_loaded || interrupt_status.idt_loaded {
+            "loaded"
+        } else {
+            "missing"
+        },
+        if interrupt_status.hardware_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        interrupt_status.ticks,
+        interrupt_status.timer_hz
+    ));
     match vm::init() {
         Some(root) => match vm::sync() {
             Ok(_) => {
@@ -74,6 +98,7 @@ pub fn activate_post_ebs_vm(boot_info: &BootInfo) {
         return;
     }
 
+    log_line(format_args!("vm activation: preparing boot map"));
     match vm::prepare_boot_identity_map(boot_info) {
         Ok(report) => log_line(format_args!(
             "vm boot map: ident={} ranges/{} pages kernel={} ranges/{} pages stack=0x{:016x}/{} pages hhdm={} ranges/{} pages @ 0x{:016x}",
@@ -99,6 +124,12 @@ pub fn activate_post_ebs_vm(boot_info: &BootInfo) {
             log_line(format_args!(
                 "vm switched to kernel page tables at 0x{:016x}",
                 root
+            ));
+            let interrupt_status = interrupts::status();
+            log_line(format_args!(
+                "interrupts: hw=deferred ticks={} hz={}",
+                interrupt_status.ticks,
+                interrupt_status.timer_hz
             ));
             let snapshot = boot::snapshot();
             match snapshot.hhdm_probe {
@@ -126,6 +157,7 @@ pub fn activate_post_ebs_vm(boot_info: &BootInfo) {
 
 pub fn adopt_current_post_ebs_vm(boot_info: &BootInfo) {
     memory::init(boot_info);
+    interrupts::init_idt();
     boot::record_firmware_entry();
 
     match vm::adopt_current_root() {

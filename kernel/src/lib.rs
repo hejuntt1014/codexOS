@@ -4,7 +4,7 @@ extern crate alloc;
 
 mod allocator;
 
-pub use boot_runtime::{boot, memory, serial, vm};
+pub use boot_runtime::{boot, interrupts, memory, serial, vm};
 pub use desktop_runtime::{DesktopApp, DesktopInput, PointerSample};
 
 use bootinfo::BootInfo;

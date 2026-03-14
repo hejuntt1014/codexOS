@@ -104,9 +104,12 @@ fn main() -> Status {
     let mut desktop = DesktopApp::new(&boot_info);
 
     loop {
+        let mut had_input = false;
+
         while let Ok(Some(key)) = input.read_key() {
             if let Some(action) = translate_key(key) {
                 desktop.handle_input(action);
+                had_input = true;
             }
         }
 
@@ -119,18 +122,28 @@ fn main() -> Status {
                     right_button: state.button[1],
                 };
                 desktop.handle_pointer(sample);
+                had_input = true;
             }
         }
 
+        let mut rendered = false;
         if desktop.needs_redraw() {
             desktop.render(&boot_info);
+            rendered = true;
         }
 
         if desktop.should_exit() {
             break;
         }
 
-        boot::stall(Duration::from_millis(16));
+        let idle_delay_ms = if had_input {
+            1
+        } else if rendered {
+            4
+        } else {
+            8
+        };
+        boot::stall(Duration::from_millis(idle_delay_ms));
     }
 
     Status::SUCCESS
