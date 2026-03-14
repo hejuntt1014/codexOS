@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "boot/uefi-loader",
+    "kernel",
+    "libs/bootinfo",
+    "libs/gfx",
+    "xtask",
+]
+default-members = ["xtask"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+authors = ["Codex + user"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+bootinfo = { path = "libs/bootinfo" }
+fatfs = "0.3.6"
+gfx = { path = "libs/gfx" }
+kernel = { path = "kernel" }
+uefi = "0.36.1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+

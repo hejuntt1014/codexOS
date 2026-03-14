@@ -1,0 +1,5 @@
+/target
+/build/*.img
+/build/*.log
+/build/*.fd
+
