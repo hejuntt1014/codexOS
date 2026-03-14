@@ -2,6 +2,7 @@
 
 use bootinfo::{FrameBufferInfo, PixelFormat};
 use core::cmp::{max, min};
+use font8x8::{BASIC_FONTS, UnicodeFonts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
@@ -22,6 +23,19 @@ pub struct Canvas {
 
 impl Canvas {
     pub unsafe fn from_framebuffer(info: FrameBufferInfo) -> Self {
+        Self { info }
+    }
+
+    pub fn from_buffer(buffer: &mut [u8], template: FrameBufferInfo) -> Self {
+        let info = FrameBufferInfo {
+            base: buffer.as_mut_ptr(),
+            size: buffer.len(),
+            width: template.width,
+            height: template.height,
+            stride: template.stride,
+            bytes_per_pixel: template.bytes_per_pixel,
+            pixel_format: template.pixel_format,
+        };
         Self { info }
     }
 
@@ -145,6 +159,90 @@ impl Canvas {
         }
     }
 
+    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: Color, scale: i32) {
+        if scale <= 0 {
+            return;
+        }
+
+        let mut cursor_x = x;
+        let mut cursor_y = y;
+        let step = 8 * scale;
+
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    cursor_x = x;
+                    cursor_y += step + scale;
+                }
+                '\r' => {}
+                _ => {
+                    self.draw_char(cursor_x, cursor_y, ch, color, scale);
+                    cursor_x += step;
+                }
+            }
+        }
+    }
+
+    pub fn draw_text_box(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        text: &str,
+        color: Color,
+        scale: i32,
+    ) {
+        if width <= 0 || scale <= 0 {
+            return;
+        }
+
+        let glyph_width = 8 * scale;
+        let max_columns = max(1, width / glyph_width);
+        let mut cursor_x = x;
+        let mut cursor_y = y;
+        let mut column = 0;
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                cursor_x = x;
+                cursor_y += glyph_width + scale;
+                column = 0;
+                continue;
+            }
+
+            if column >= max_columns {
+                cursor_x = x;
+                cursor_y += glyph_width + scale;
+                column = 0;
+            }
+
+            self.draw_char(cursor_x, cursor_y, ch, color, scale);
+            cursor_x += glyph_width;
+            column += 1;
+        }
+    }
+
+    pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: Color, scale: i32) {
+        if scale <= 0 {
+            return;
+        }
+
+        let glyph = BASIC_FONTS.get(ch).or_else(|| BASIC_FONTS.get('?'));
+        let Some(glyph) = glyph else {
+            return;
+        };
+
+        for (row_index, row_bits) in glyph.iter().enumerate() {
+            for col_index in 0..8 {
+                if (row_bits >> col_index) & 1 == 1 {
+                    let px = x + (col_index as i32 * scale);
+                    let py = y + (row_index as i32 * scale);
+                    self.fill_rect(px, py, scale, scale, color);
+                }
+            }
+        }
+    }
+
     fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
         if x < 0 || y < 0 || x >= self.width() || y >= self.height() {
             return;
@@ -179,6 +277,12 @@ impl Canvas {
             buffer[pixel_index + 3] = 0;
         }
     }
+}
+
+pub fn blit_buffer_to_framebuffer(buffer: &[u8], framebuffer: FrameBufferInfo) {
+    let copy_len = min(buffer.len(), framebuffer.size);
+    let target = unsafe { core::slice::from_raw_parts_mut(framebuffer.base, copy_len) };
+    target.copy_from_slice(&buffer[..copy_len]);
 }
 
 fn blend(from: Color, to: Color, numerator: u32, denominator: u32) -> Color {

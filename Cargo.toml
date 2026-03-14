@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "boot/uefi-loader",
+    "kernel-image",
     "kernel",
     "libs/bootinfo",
     "libs/gfx",
@@ -18,9 +19,11 @@ authors = ["Codex + user"]
 anyhow = "1.0.102"
 bootinfo = { path = "libs/bootinfo" }
 fatfs = "0.3.6"
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
 gfx = { path = "libs/gfx" }
 kernel = { path = "kernel" }
 uefi = "0.36.1"
+xmas-elf = "0.10.0"
 
 [profile.dev]
 panic = "abort"
@@ -29,4 +32,3 @@ panic = "abort"
 codegen-units = 1
 lto = "fat"
 panic = "abort"
-

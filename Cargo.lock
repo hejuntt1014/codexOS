@@ -111,10 +111,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "gfx"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "font8x8",
 ]
 
 [[package]]
@@ -157,6 +164,13 @@ version = "0.1.0"
 dependencies = [
  "bootinfo",
  "gfx",
+]
+
+[[package]]
+name = "kernel-image"
+version = "0.1.0"
+dependencies = [
+ "bootinfo",
 ]
 
 [[package]]
@@ -279,6 +293,7 @@ dependencies = [
  "bootinfo",
  "kernel",
  "uefi",
+ "xmas-elf",
 ]
 
 [[package]]
@@ -419,9 +434,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "xmas-elf"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18245fcbb8b3de8dd198ce7944fdd4096986fd6cd306b0fcfa27df817bd545d6"
+dependencies = [
+ "zero",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "fatfs",
 ]
+
+[[package]]
+name = "zero"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fe21bcc34ca7fe6dd56cc2cb1261ea59d6b93620215aefb5ea6032265527784"

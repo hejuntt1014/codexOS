@@ -12,17 +12,82 @@
 ```powershell
 cargo xtask env
 cargo xtask run
+cargo xtask handoff
+cargo xtask chainload
 cargo xtask debug
 cargo xtask smoke
+cargo xtask smoke-handoff
+cargo xtask smoke-chainload
 ```
 
 `cargo xtask debug` starts QEMU paused and exposes a gdb stub on TCP port `1234`.
 `cargo xtask smoke` runs QEMU headlessly for a few seconds and verifies the serial log automatically.
+`cargo xtask smoke-handoff` verifies the post-`ExitBootServices` path and checks for `boot mode: post-exit-boot-services`.
+`cargo xtask smoke-chainload` verifies the standalone kernel chainload path and checks for `codexOS standalone kernel entered`.
 
 ## Current debug signals
 
 - Serial line `codexOS kernel entered` confirms the handoff into the kernel crate.
 - A visible desktop scene confirms that GOP framebuffer access works.
+- Serial line `memory map: ...` confirms the loader collected and handed off memory regions.
+- Serial line `boot mode: ...` confirms whether the kernel is still under UEFI boot services or already firmware-detached.
+- Serial line `reserved memory: ...` confirms the loader marked the image, framebuffer, and memory-map buffer as in-use.
+- Serial line `kernel image: ...` confirms the loader found `KERNEL.ELF`, parsed the ELF header, allocated pages for its loadable segments, and computed a staged entry address.
+- Serial line `codexOS standalone kernel entered` confirms the chainload mode jumped into the standalone kernel image after the loader-built boot VM was activated.
+- Serial line `vm: root table at ... synced` confirms the kernel wrote the current page-table image into physical pages.
+- Serial line `vm boot map: ...` confirms the handoff path built an identity-mapped boot address space plus a boot-time higher-half direct-map window.
+- The `stack=...` portion of `vm boot map: ...` shows the explicit identity-mapped stack window kept alive after handoff.
+- Serial line `vm switched to kernel page tables at ...` confirms the handoff path successfully loaded the new `CR3`.
+- Serial line `vm hhdm probe: ...` confirms the kernel can read the active root page table through the higher-half direct map after switching.
+- Serial line `vm framebuffer hhdm: ...` confirms the framebuffer has a usable higher-half direct-map address after switching.
+- Serial line `vm reserved hhdm: ...` confirms the loader image and memory-map buffer both have higher-half aliases after switching.
+- Serial line `page allocator: ...` confirms the kernel turned usable regions into page-allocation state.
+- Serial line `vm: root table at ...` confirms the kernel initialized the virtual-memory manager.
+- Serial line `pointer input: available` confirms mouse support was discovered.
+
+## Interaction smoke
+
+The current interactive desktop supports:
+
+- arrow-key window movement
+- `Tab` focus cycling
+- terminal command entry with `Enter` and `Backspace`
+- mouse title-bar dragging when a pointer device is exposed by UEFI
+
+## Shell commands
+
+The built-in terminal currently supports:
+
+- `help`
+- `status`
+- `boot`
+- `kernel`
+- `mem`
+- `reserved`
+- `regions`
+- `region <index>`
+- `alloc-page`
+- `alloc <count>`
+- `vm`
+- `vm-sync`
+- `map-test`
+- `map <count>`
+- `translate <address>`
+- `walk <address>`
+- `hhdm <physical-address>`
+- `fb`
+- `aliases`
+- `phases`
+- `pt-entry <table-phys> <index>`
+- `theme`
+- `clear`
+- `focus`
+- `move-left`
+- `move-right`
+- `move-up`
+- `move-down`
+- `about`
+- `exit`
 
 ## Recommended next debug upgrades
 
