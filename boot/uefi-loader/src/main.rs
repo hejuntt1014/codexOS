@@ -3,16 +3,20 @@
 
 extern crate alloc;
 
+mod allocator;
+
+use alloc::boxed::Box;
 use bootinfo::{
     BootInfo, FirmwareMode, FrameBufferInfo, KERNEL_SEGMENT_FLAG_EXECUTE,
     KERNEL_SEGMENT_FLAG_READ, KERNEL_SEGMENT_FLAG_WRITE, KernelImageInfo, KernelImageSegment,
     MAX_KERNEL_IMAGE_SEGMENTS, MAX_MEMORY_REGIONS, MAX_RESERVED_MEMORY_RANGES, MemoryRegion,
     MemoryRegionKind, PAGE_SIZE, PixelFormat, ReservedMemoryKind, ReservedMemoryRange,
 };
+use boot_runtime::{activate_post_ebs_vm, init, log_line};
 use core::mem;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 use core::time::Duration;
-use kernel::{DesktopApp, DesktopInput, PointerSample, init};
+use desktop_runtime::{DesktopApp, DesktopInput, PointerSample};
 use uefi::boot::{self, AllocateType};
 use uefi::fs::FileSystem;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
@@ -27,6 +31,9 @@ use xmas_elf::program::Type as ProgramType;
 
 const LOW_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024;
 const RUNTIME_HHDM_BASE: u64 = 0xffff_8000_0000_0000;
+
+#[global_allocator]
+static ALLOCATOR: allocator::BumpAllocator = allocator::BumpAllocator;
 
 #[entry]
 fn main() -> Status {
@@ -89,9 +96,9 @@ fn main() -> Status {
     let _ = input.reset(false);
     if let Some(pointer) = pointer.as_mut() {
         let _ = pointer.reset(false);
-        kernel::log_line(format_args!("pointer input: available"));
+        log_line(format_args!("pointer input: available"));
     } else {
-        kernel::log_line(format_args!("pointer input: unavailable"));
+        log_line(format_args!("pointer input: unavailable"));
     }
 
     let mut desktop = DesktopApp::new(&boot_info);
@@ -152,18 +159,19 @@ fn run_handoff_mode(
             memory_map.buffer().len() as u64,
         )),
     );
+    let boot_info = Box::leak(Box::new(boot_info));
 
-    init(&boot_info);
-    log_boot_context(&boot_info);
-    kernel::activate_post_ebs_vm(&boot_info);
+    init(boot_info);
+    log_boot_context(boot_info);
+    activate_post_ebs_vm(boot_info);
 
     if cfg!(feature = "chainload") {
-        return chainload_kernel(&boot_info);
+        return chainload_kernel(boot_info);
     }
 
-    let mut desktop = DesktopApp::new(&boot_info);
+    let mut desktop = DesktopApp::new(boot_info);
     desktop.note_handoff_complete();
-    desktop.render(&boot_info);
+    desktop.render(boot_info);
 
     loop {
         core::hint::spin_loop();
@@ -282,17 +290,17 @@ fn push_reserved_range(
 }
 
 fn log_boot_context(boot_info: &BootInfo) {
-    kernel::log_line(format_args!(
+    log_line(format_args!(
         "boot mode: {}",
         boot_info.firmware_mode.as_str()
     ));
-    kernel::log_line(format_args!(
+    log_line(format_args!(
         "reserved memory: {} ranges {} KiB",
         boot_info.reserved_memory_count,
         boot_info.reserved_memory_bytes() / 1024
     ));
     if boot_info.kernel_image.is_present() {
-        kernel::log_line(format_args!(
+        log_line(format_args!(
             "kernel image: {} bytes entry=0x{:016x} staged=0x{:016x} phdrs={} load={}/{} staged={}",
             boot_info.kernel_image.image_size,
             boot_info.kernel_image.entry_point,
@@ -303,7 +311,7 @@ fn log_boot_context(boot_info: &BootInfo) {
             boot_info.kernel_image.loaded_segment_count
         ));
     } else {
-        kernel::log_line(format_args!("kernel image: unavailable"));
+        log_line(format_args!("kernel image: unavailable"));
     }
 }
 
@@ -386,7 +394,7 @@ fn encode_segment_flags(flags: xmas_elf::program::Flags) -> u32 {
 }
 
 fn chainload_kernel(boot_info: &BootInfo) -> Status {
-    let entry = boot_info.kernel_image.loaded_entry_point;
+    let entry = boot_info.kernel_image.entry_point;
     if entry == 0 {
         return Status::LOAD_ERROR;
     }

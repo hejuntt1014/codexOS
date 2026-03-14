@@ -42,6 +42,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "boot-runtime"
+version = "0.1.0"
+dependencies = [
+ "bootinfo",
+]
+
+[[package]]
 name = "bootinfo"
 version = "0.1.0"
 
@@ -91,6 +98,15 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "desktop-runtime"
+version = "0.1.0"
+dependencies = [
+ "boot-runtime",
+ "bootinfo",
+ "gfx",
+]
 
 [[package]]
 name = "fatfs"
@@ -162,7 +178,9 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "boot-runtime",
  "bootinfo",
+ "desktop-runtime",
  "gfx",
 ]
 
@@ -171,6 +189,7 @@ name = "kernel-image"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "gfx",
 ]
 
 [[package]]
@@ -290,8 +309,9 @@ dependencies = [
 name = "uefi-loader"
 version = "0.1.0"
 dependencies = [
+ "boot-runtime",
  "bootinfo",
- "kernel",
+ "desktop-runtime",
  "uefi",
  "xmas-elf",
 ]

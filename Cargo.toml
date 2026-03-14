@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "boot/uefi-loader",
+    "libs/desktop-runtime",
     "kernel-image",
     "kernel",
+    "libs/boot-runtime",
     "libs/bootinfo",
     "libs/gfx",
     "xtask",
@@ -17,7 +19,9 @@ authors = ["Codex + user"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+boot-runtime = { path = "libs/boot-runtime" }
 bootinfo = { path = "libs/bootinfo" }
+desktop-runtime = { path = "libs/desktop-runtime" }
 fatfs = "0.3.6"
 font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
 gfx = { path = "libs/gfx" }
@@ -30,5 +34,7 @@ panic = "abort"
 
 [profile.release]
 codegen-units = 1
+debug = 0
 lto = "fat"
 panic = "abort"
+strip = "symbols"

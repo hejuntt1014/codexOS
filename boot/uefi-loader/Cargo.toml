@@ -11,7 +11,8 @@ handoff = []
 chainload = []
 
 [dependencies]
+boot-runtime.workspace = true
 bootinfo.workspace = true
-kernel.workspace = true
+desktop-runtime.workspace = true
 uefi = { workspace = true, features = ["alloc", "panic_handler"] }
 xmas-elf.workspace = true

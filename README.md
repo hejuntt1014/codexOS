@@ -17,6 +17,8 @@ The repository currently implements:
 - a separate `kernel-image` ELF built for `x86_64-unknown-none` and packed into the boot disk as `KERNEL.ELF`
 - an alternate `handoff` loader mode that exits UEFI boot services before rendering the desktop
 - a `chainload` validation mode that stages the standalone kernel at its linked address, switches to the boot VM, and jumps into the standalone entry point
+- a shared `boot-runtime` layer that now owns early serial logging, physical-page discovery, boot-state tracking, and boot-VM activation for both the loader and the resident kernel path
+- a shared `desktop-runtime` layer that now owns the GUI desktop loop, so `uefi-loader` no longer links the resident `kernel` crate just to render the desktop
 - a `kernel` crate with a simple bump allocator, physical page allocator, and stateful desktop runtime
 - a loader-side ELF inspection and staging step that parses the standalone kernel image, allocates pages for its `PT_LOAD` segments, copies them into memory, and surfaces the staged entry point in boot info, logs, and the desktop shell
 - an early virtual-memory manager that allocates page-table pages, tracks demo mappings, syncs them into physical memory, activates a handoff page table via `CR3`, verifies a boot-time higher-half direct-map window, and trims the post-handoff identity map to a small boot footprint

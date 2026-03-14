@@ -1,9 +1,10 @@
 #![no_std]
 #![no_main]
 
-use bootinfo::BootInfo;
+use bootinfo::{BootInfo, FrameBufferInfo};
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
+use gfx::{Canvas, Color};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,9 +38,13 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     serial_write_str("codexOS standalone kernel entered\r\n");
 
     if let Some(boot_info) = unsafe { boot_info.as_ref() } {
-        draw_takeover(boot_info);
         serial_write_str("standalone boot info present\r\n");
-        serial_write_str("standalone framebuffer takeover complete\r\n");
+        if render_standalone_desktop(boot_info) {
+            serial_write_str("standalone framebuffer takeover complete\r\n");
+            serial_write_str("standalone desktop rendered\r\n");
+        } else {
+            serial_write_str("standalone framebuffer unavailable\r\n");
+        }
     } else {
         serial_write_str("standalone boot info missing\r\n");
     }
@@ -57,6 +62,213 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 }
 
 const COM1: u16 = 0x3F8;
+
+fn render_standalone_desktop(boot_info: &BootInfo) -> bool {
+    let Some(framebuffer) = runtime_framebuffer(boot_info) else {
+        return false;
+    };
+    let width = framebuffer.width as i32;
+    let height = framebuffer.height as i32;
+
+    let mut canvas = unsafe { Canvas::from_framebuffer(framebuffer) };
+    canvas.vertical_gradient(Color::rgb(11, 17, 24), Color::rgb(26, 44, 61));
+    canvas.checkerboard(
+        48,
+        Color::rgb(17, 26, 35),
+        Color::rgb(38, 78, 110),
+        1,
+        6,
+    );
+
+    canvas.fill_rect(24, 24, width - 48, height - 48, Color::rgb(243, 246, 248));
+    canvas.draw_shadow(24, 24, width - 48, height - 48, 6, Color::rgb(10, 15, 20));
+    canvas.fill_rect(24, 24, width - 48, 72, Color::rgb(19, 88, 126));
+    canvas.fill_rect(24, height - 92, width - 48, 44, Color::rgb(229, 235, 238));
+    canvas.fill_rect(24, height - 92, width - 48, 1, Color::rgb(197, 205, 210));
+
+    draw_header(&mut canvas, boot_info, width);
+    draw_overview_card(&mut canvas, boot_info, 56, 128, width / 2 - 72, 292);
+    draw_kernel_card(
+        &mut canvas,
+        boot_info,
+        width / 2 + 16,
+        128,
+        width / 2 - 72,
+        292,
+    );
+    draw_footer(&mut canvas, boot_info, width, height);
+    draw_cursor_accent(&mut canvas, width, height);
+
+    true
+}
+
+fn draw_header(canvas: &mut Canvas, boot_info: &BootInfo, width: i32) {
+    let ink = Color::rgb(245, 248, 250);
+    let sub = Color::rgb(205, 223, 231);
+    draw_label(canvas, 52, 42, "CODEXOS", ink, 3);
+    draw_label(canvas, 52, 68, "STANDALONE", sub, 2);
+    draw_label(canvas, 52, 92, "CHAINLOAD DESKTOP", sub, 1);
+    let mode_label = if boot_info.firmware_mode.as_str() == "post-exit-boot-services" {
+        "MODE POST EBS"
+    } else {
+        "MODE UEFI"
+    };
+    draw_label(canvas, width - 286, 48, mode_label, ink, 1);
+}
+
+fn draw_overview_card(
+    canvas: &mut Canvas,
+    boot_info: &BootInfo,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    let title = Color::rgb(24, 35, 44);
+    let body = Color::rgb(70, 82, 92);
+    let accent = Color::rgb(36, 127, 170);
+    let panel = Color::rgb(255, 255, 255);
+
+    canvas.fill_rect(x, y, width, height, panel);
+    canvas.draw_rect(x, y, width, height, Color::rgb(211, 218, 223));
+    canvas.fill_rect(x, y, width, 40, Color::rgb(233, 239, 242));
+    draw_label(canvas, x + 18, y + 14, "BOOT SNAPSHOT", title, 1);
+
+    draw_label(canvas, x + 18, y + 58, "FRAMEBUFFER", body, 1);
+    draw_label(canvas, x + 18, y + 82, "MEMORY MAP", body, 1);
+    draw_label(canvas, x + 18, y + 106, "USABLE MEMORY", body, 1);
+
+    canvas.fill_rect(x + 18, y + 138, width - 36, 14, Color::rgb(225, 231, 234));
+    let usage_width =
+        ((width - 36) as u64).saturating_mul(boot_info.usable_memory_bytes()) / boot_info.total_memory_bytes().max(1);
+    canvas.fill_rect(
+        x + 18,
+        y + 138,
+        usage_width as i32,
+        14,
+        accent,
+    );
+
+    draw_label(canvas, x + 18, y + 176, "RESERVED OBJECTS", title, 1);
+    draw_label(canvas, x + 18, y + 204, "LOW MEMORY", body, 1);
+    draw_label(canvas, x + 18, y + 226, "LOADER IMAGE", body, 1);
+    draw_label(canvas, x + 18, y + 248, "FRAMEBUFFER", body, 1);
+
+    canvas.fill_rect(x + 18, y + height - 70, width - 36, 44, Color::rgb(241, 246, 248));
+    canvas.draw_rect(
+        x + 18,
+        y + height - 70,
+        width - 36,
+        44,
+        Color::rgb(214, 221, 226),
+    );
+    draw_label(canvas, x + 32, y + height - 56, "FRAMEBUFFER ACTIVE", accent, 1);
+}
+
+fn draw_kernel_card(
+    canvas: &mut Canvas,
+    boot_info: &BootInfo,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    let title = Color::rgb(24, 35, 44);
+    let body = Color::rgb(70, 82, 92);
+    let accent = Color::rgb(32, 92, 128);
+
+    canvas.fill_rect(x, y, width, height, Color::rgb(248, 250, 251));
+    canvas.draw_rect(x, y, width, height, Color::rgb(211, 218, 223));
+    canvas.fill_rect(x, y, width, 40, Color::rgb(232, 238, 241));
+    draw_label(canvas, x + 18, y + 14, "KERNEL IMAGE", title, 1);
+
+    draw_label(canvas, x + 18, y + 58, "CHAINLOAD ENTRY", body, 1);
+    draw_label(canvas, x + 18, y + 82, "STAGED PAGES", body, 1);
+    draw_label(canvas, x + 18, y + 106, "DIRECT FRAMEBUFFER", body, 1);
+
+    draw_label(canvas, x + 18, y + 146, "LOAD SEGMENTS", title, 1);
+    let mut row_y = y + 174;
+    for (index, segment) in boot_info.kernel_image.segments().iter().take(2).enumerate() {
+        canvas.fill_rect(x + 18, row_y - 4, width - 36, 42, Color::rgb(239, 244, 246));
+        canvas.draw_rect(
+            x + 18,
+            row_y - 4,
+            width - 36,
+            42,
+            Color::rgb(217, 223, 227),
+        );
+        if index == 0 {
+            draw_label(canvas, x + 30, row_y + 12, "TEXT SEGMENT", accent, 1);
+            let bar_width =
+                ((width - 86) as u64).saturating_mul(segment.load_page_count) / boot_info.kernel_image.load_page_count.max(1);
+            canvas.fill_rect(x + 30, row_y + 26, width - 86, 6, Color::rgb(217, 223, 227));
+            canvas.fill_rect(x + 30, row_y + 26, bar_width as i32, 6, accent);
+        } else {
+            draw_label(canvas, x + 30, row_y + 12, "DATA SEGMENT", accent, 1);
+            let bar_width =
+                ((width - 86) as u64).saturating_mul(segment.load_page_count) / boot_info.kernel_image.load_page_count.max(1);
+            canvas.fill_rect(x + 30, row_y + 26, width - 86, 6, Color::rgb(217, 223, 227));
+            canvas.fill_rect(x + 30, row_y + 26, bar_width as i32, 6, body);
+        }
+        row_y += 54;
+    }
+
+    canvas.fill_rect(x + 18, y + height - 120, width - 36, 84, Color::rgb(32, 92, 128));
+    draw_label(
+        canvas,
+        x + 28,
+        y + height - 104,
+        "NEXT MILESTONE",
+        Color::rgb(238, 245, 248),
+        1,
+    );
+    draw_label(
+        canvas,
+        x + 28,
+        y + height - 82,
+        "OWN EVENT LOOP",
+        Color::rgb(214, 229, 236),
+        1,
+    );
+    draw_label(
+        canvas,
+        x + 28,
+        y + height - 62,
+        "AND SHELL",
+        Color::rgb(214, 229, 236),
+        1,
+    );
+}
+
+fn draw_footer(canvas: &mut Canvas, boot_info: &BootInfo, width: i32, height: i32) {
+    let _ = boot_info;
+    draw_label(canvas, 42, height - 76, "POST EBS HANDOFF ACTIVE", Color::rgb(78, 91, 101), 1);
+
+    draw_label(
+        canvas,
+        width - 262,
+        height - 76,
+        "SERIAL DESKTOP RENDERED",
+        Color::rgb(32, 92, 128),
+        1,
+    );
+}
+
+fn draw_cursor_accent(canvas: &mut Canvas, width: i32, height: i32) {
+    canvas.fill_rect(width - 126, 122, 14, 14, Color::rgb(32, 92, 128));
+    canvas.fill_rect(width - 98, 122, 14, 14, Color::rgb(47, 127, 164));
+    canvas.fill_rect(width - 70, 122, 14, 14, Color::rgb(83, 166, 201));
+    canvas.draw_cursor(width - 112, height - 148);
+}
+
+fn runtime_framebuffer(boot_info: &BootInfo) -> Option<FrameBufferInfo> {
+    let mut framebuffer = boot_info.framebuffer;
+    let mapped_base = boot_info
+        .runtime_hhdm_base
+        .checked_add(framebuffer.base as u64)?;
+    framebuffer.base = mapped_base as *mut u8;
+    Some(framebuffer)
+}
 
 fn serial_init() {
     unsafe {
@@ -76,98 +288,6 @@ fn serial_write_str(value: &str) {
             while (inb(COM1 + 5) & 0x20) == 0 {}
             outb(COM1, byte);
         }
-    }
-}
-
-fn draw_takeover(boot_info: &BootInfo) {
-    let width = boot_info.framebuffer.width as i32;
-    let height = boot_info.framebuffer.height as i32;
-
-    fill_rect(boot_info, 0, 0, width, height, 6, 12, 24);
-    fill_rect(boot_info, 0, height / 2, width, height / 2, 9, 87, 122);
-
-    for index in 0..10 {
-        let x = 56 + index * 84;
-        let y = 52 + (index % 2) * 18;
-        fill_rect(boot_info, x, y, 56, 18, 255, 255, 255);
-    }
-
-    let panel_x = width / 2 - 240;
-    let panel_y = height / 2 - 120;
-    fill_rect(boot_info, panel_x, panel_y, 480, 240, 241, 245, 249);
-    draw_rect(boot_info, panel_x, panel_y, 480, 240, 15, 23, 42);
-    fill_rect(boot_info, panel_x, panel_y, 480, 28, 14, 165, 233);
-
-    fill_rect(boot_info, panel_x + 24, panel_y + 56, 432, 36, 15, 23, 42);
-    fill_rect(boot_info, panel_x + 24, panel_y + 104, 432, 36, 34, 197, 94);
-    fill_rect(boot_info, panel_x + 24, panel_y + 152, 432, 36, 251, 191, 36);
-    fill_rect(boot_info, panel_x + 24, panel_y + 200, 432, 16, 59, 130, 246);
-}
-
-fn fill_rect(
-    boot_info: &BootInfo,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    r: u8,
-    g: u8,
-    b: u8,
-) {
-    let framebuffer = runtime_framebuffer_base(boot_info);
-    let stride = boot_info.framebuffer.stride as i32;
-    let bpp = boot_info.framebuffer.bytes_per_pixel as i32;
-    let screen_width = boot_info.framebuffer.width as i32;
-    let screen_height = boot_info.framebuffer.height as i32;
-
-    let x0 = x.clamp(0, screen_width);
-    let y0 = y.clamp(0, screen_height);
-    let x1 = (x + width).clamp(0, screen_width);
-    let y1 = (y + height).clamp(0, screen_height);
-
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let offset = (py * stride + px) * bpp;
-            unsafe {
-                let pixel = framebuffer.add(offset as usize);
-                core::ptr::write_volatile(pixel, b);
-                core::ptr::write_volatile(pixel.add(1), g);
-                core::ptr::write_volatile(pixel.add(2), r);
-                if bpp > 3 {
-                    core::ptr::write_volatile(pixel.add(3), 0);
-                }
-            }
-        }
-    }
-}
-
-fn draw_rect(
-    boot_info: &BootInfo,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    r: u8,
-    g: u8,
-    b: u8,
-) {
-    fill_rect(boot_info, x, y, width, 1, r, g, b);
-    fill_rect(boot_info, x, y + height - 1, width, 1, r, g, b);
-    fill_rect(boot_info, x, y, 1, height, r, g, b);
-    fill_rect(boot_info, x + width - 1, y, 1, height, r, g, b);
-}
-
-fn runtime_framebuffer_base(boot_info: &BootInfo) -> *mut u8 {
-    if boot_info.runtime_hhdm_base != 0 {
-        boot_info
-            .runtime_hhdm_base
-            .saturating_add(boot_info.framebuffer.base as u64) as *mut u8
-    } else {
-        boot_info.framebuffer.base
     }
 }
 
@@ -193,4 +313,77 @@ unsafe fn inb(port: u16) -> u8 {
         );
     }
     value
+}
+
+fn draw_label(canvas: &mut Canvas, x: i32, y: i32, text: &str, color: Color, scale: i32) {
+    if scale <= 0 {
+        return;
+    }
+
+    let mut cursor_x = x;
+    for ch in text.chars() {
+        if ch == '\n' {
+            continue;
+        }
+        if let Some(pattern) = glyph_pattern(ch) {
+            for (row, bits) in pattern.iter().enumerate() {
+                for col in 0..3 {
+                    if (bits >> (2 - col)) & 1 == 1 {
+                        canvas.fill_rect(
+                            cursor_x + col * scale,
+                            y + row as i32 * scale,
+                            scale,
+                            scale,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+        cursor_x += 4 * scale;
+    }
+}
+
+fn glyph_pattern(ch: char) -> Option<[u8; 5]> {
+    match ch {
+        'A' => Some([0b010, 0b101, 0b111, 0b101, 0b101]),
+        'B' => Some([0b110, 0b101, 0b110, 0b101, 0b110]),
+        'C' => Some([0b011, 0b100, 0b100, 0b100, 0b011]),
+        'D' => Some([0b110, 0b101, 0b101, 0b101, 0b110]),
+        'E' => Some([0b111, 0b100, 0b110, 0b100, 0b111]),
+        'F' => Some([0b111, 0b100, 0b110, 0b100, 0b100]),
+        'G' => Some([0b011, 0b100, 0b101, 0b101, 0b011]),
+        'H' => Some([0b101, 0b101, 0b111, 0b101, 0b101]),
+        'I' => Some([0b111, 0b010, 0b010, 0b010, 0b111]),
+        'J' => Some([0b001, 0b001, 0b001, 0b101, 0b010]),
+        'K' => Some([0b101, 0b101, 0b110, 0b101, 0b101]),
+        'L' => Some([0b100, 0b100, 0b100, 0b100, 0b111]),
+        'M' => Some([0b111, 0b111, 0b101, 0b101, 0b101]),
+        'N' => Some([0b101, 0b111, 0b111, 0b111, 0b101]),
+        'O' => Some([0b010, 0b101, 0b101, 0b101, 0b010]),
+        'P' => Some([0b110, 0b101, 0b110, 0b100, 0b100]),
+        'Q' => Some([0b010, 0b101, 0b101, 0b010, 0b001]),
+        'R' => Some([0b110, 0b101, 0b110, 0b101, 0b101]),
+        'S' => Some([0b011, 0b100, 0b010, 0b001, 0b110]),
+        'T' => Some([0b111, 0b010, 0b010, 0b010, 0b010]),
+        'U' => Some([0b101, 0b101, 0b101, 0b101, 0b111]),
+        'V' => Some([0b101, 0b101, 0b101, 0b101, 0b010]),
+        'W' => Some([0b101, 0b101, 0b101, 0b111, 0b111]),
+        'X' => Some([0b101, 0b101, 0b010, 0b101, 0b101]),
+        'Y' => Some([0b101, 0b101, 0b010, 0b010, 0b010]),
+        '0' => Some([0b111, 0b101, 0b101, 0b101, 0b111]),
+        '1' => Some([0b010, 0b110, 0b010, 0b010, 0b111]),
+        '2' => Some([0b110, 0b001, 0b010, 0b100, 0b111]),
+        '3' => Some([0b110, 0b001, 0b010, 0b001, 0b110]),
+        '4' => Some([0b101, 0b101, 0b111, 0b001, 0b001]),
+        '5' => Some([0b111, 0b100, 0b110, 0b001, 0b110]),
+        '6' => Some([0b011, 0b100, 0b110, 0b101, 0b010]),
+        '7' => Some([0b111, 0b001, 0b010, 0b100, 0b100]),
+        '8' => Some([0b010, 0b101, 0b010, 0b101, 0b010]),
+        '9' => Some([0b010, 0b101, 0b011, 0b001, 0b110]),
+        ' ' => Some([0, 0, 0, 0, 0]),
+        '-' => Some([0, 0, 0b111, 0, 0]),
+        '/' => Some([0b001, 0b001, 0b010, 0b100, 0b100]),
+        _ => None,
+    }
 }

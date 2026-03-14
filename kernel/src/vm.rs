@@ -1,5 +1,8 @@
 use alloc::vec::Vec;
-use bootinfo::{BootInfo, PAGE_SIZE, ReservedMemoryKind};
+use bootinfo::{
+    BootInfo, KERNEL_SEGMENT_FLAG_EXECUTE, KERNEL_SEGMENT_FLAG_WRITE, PAGE_SIZE,
+    ReservedMemoryKind,
+};
 use core::cell::UnsafeCell;
 
 use crate::memory;
@@ -262,6 +265,54 @@ impl VirtualMemoryManager {
         Ok(newly_mapped_pages)
     }
 
+    fn map_identity_range_excluding(
+        &mut self,
+        start: u64,
+        end: u64,
+        holes: &[(u64, u64)],
+        writable: bool,
+        executable: bool,
+    ) -> Result<u64, VmError> {
+        let aligned_start = align_down(start);
+        let aligned_end = align_up(end);
+        if aligned_end <= aligned_start {
+            return Ok(0);
+        }
+
+        let mut total_pages = 0_u64;
+        let mut current = aligned_start;
+        for &(hole_start, hole_end) in holes {
+            let clipped_start = align_down(hole_start.max(aligned_start));
+            let clipped_end = align_up(hole_end.min(aligned_end));
+            if clipped_end <= clipped_start {
+                continue;
+            }
+            if clipped_start > current {
+                total_pages = total_pages.saturating_add(self.map_identity_range(
+                    current,
+                    clipped_start,
+                    writable,
+                    executable,
+                )?);
+            }
+            current = current.max(clipped_end);
+            if current >= aligned_end {
+                break;
+            }
+        }
+
+        if current < aligned_end {
+            total_pages = total_pages.saturating_add(self.map_identity_range(
+                current,
+                aligned_end,
+                writable,
+                executable,
+            )?);
+        }
+
+        Ok(total_pages)
+    }
+
     fn map_window_range(
         &mut self,
         virt_start: u64,
@@ -270,32 +321,70 @@ impl VirtualMemoryManager {
         writable: bool,
         executable: bool,
     ) -> Result<u64, VmError> {
-        if !self.initialized {
-            return Err(VmError::NotInitialized);
-        }
-
         let aligned_phys_start = align_down(phys_start);
         let aligned_phys_end = align_up(end);
         if aligned_phys_end <= aligned_phys_start {
             return Ok(0);
         }
+        let aligned_virt_start =
+            virt_start.saturating_sub(phys_start.saturating_sub(aligned_phys_start));
+
+        let page_count = aligned_phys_end
+            .saturating_sub(aligned_phys_start)
+            .checked_div(PAGE_SIZE)
+            .ok_or(VmError::AddressOverflow)? as usize;
+        self.map_fixed_range(
+            aligned_virt_start,
+            aligned_phys_start,
+            page_count,
+            writable,
+            executable,
+        )
+    }
+
+    fn map_fixed_range(
+        &mut self,
+        virt_start: u64,
+        phys_start: u64,
+        page_count: usize,
+        writable: bool,
+        executable: bool,
+    ) -> Result<u64, VmError> {
+        if !self.initialized {
+            return Err(VmError::NotInitialized);
+        }
+        if page_count == 0 {
+            return Ok(0);
+        }
+        if virt_start % PAGE_SIZE != 0 {
+            return Err(VmError::UnalignedVirtualAddress);
+        }
+        if phys_start % PAGE_SIZE != 0 {
+            return Err(VmError::UnalignedPhysicalAddress);
+        }
+
+        let total_pages = page_count as u64;
+        let range_bytes = total_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(VmError::AddressOverflow)?;
+        let _virt_end = virt_start
+            .checked_add(range_bytes)
+            .ok_or(VmError::AddressOverflow)?;
 
         let mut newly_mapped_pages = 0_u64;
-        let mut virt = virt_start;
-        let mut phys = aligned_phys_start;
-        while phys < aligned_phys_end {
+        for page_index in 0..page_count {
+            let virt = virt_start + (page_index as u64 * PAGE_SIZE);
+            let phys = phys_start + (page_index as u64 * PAGE_SIZE);
             if self.ensure_leaf_mapping(virt, phys, writable, executable)? {
                 newly_mapped_pages = newly_mapped_pages.saturating_add(1);
             }
-            virt = virt.saturating_add(PAGE_SIZE);
-            phys = phys.saturating_add(PAGE_SIZE);
         }
 
         if newly_mapped_pages != 0 {
             self.mapped_pages = self.mapped_pages.saturating_add(newly_mapped_pages);
             self.mappings.push(Mapping {
                 virt_start,
-                phys_start: aligned_phys_start,
+                phys_start,
                 page_count: newly_mapped_pages,
                 writable,
                 executable,
@@ -313,6 +402,8 @@ impl VirtualMemoryManager {
         let mut report = BootVmReport {
             identity_ranges: 0,
             identity_pages: 0,
+            kernel_image_ranges: 0,
+            kernel_image_pages: 0,
             stack_window_start: 0,
             stack_window_pages: 0,
             higher_half_ranges: 0,
@@ -320,7 +411,15 @@ impl VirtualMemoryManager {
             higher_half_base: HIGH_HALF_DIRECT_MAP_BASE,
         };
 
-        let pages = self.map_identity_range(0, IDENTITY_BOOT_WINDOW_BYTES, true, true)?;
+        let kernel_holes = kernel_virtual_holes(boot_info, 0, IDENTITY_BOOT_WINDOW_BYTES);
+        let pages = self.map_identity_range_excluding(
+            0,
+            IDENTITY_BOOT_WINDOW_BYTES,
+            &kernel_holes,
+            true,
+            true,
+        )
+        .map_err(|err| remap_conflict(err, VmError::BootIdentityConflict))?;
         if pages != 0 {
             report.identity_ranges += 1;
             report.identity_pages = report.identity_pages.saturating_add(pages);
@@ -329,7 +428,9 @@ impl VirtualMemoryManager {
         let stack_pointer = current_stack_pointer();
         let stack_start = stack_pointer.saturating_sub(STACK_WINDOW_BYTES / 2);
         let stack_end = stack_pointer.saturating_add(STACK_WINDOW_BYTES / 2);
-        let pages = self.map_identity_range(stack_start, stack_end, true, false)?;
+        let pages = self
+            .map_identity_range(stack_start, stack_end, true, false)
+            .map_err(|err| remap_conflict(err, VmError::BootStackConflict))?;
         if pages != 0 {
             report.identity_ranges += 1;
             report.identity_pages = report.identity_pages.saturating_add(pages);
@@ -338,8 +439,9 @@ impl VirtualMemoryManager {
         }
 
         let boot_window_virt = higher_half_phys(0).ok_or(VmError::AddressOverflow)?;
-        let pages =
-            self.map_window_range(boot_window_virt, 0, HIGH_HALF_BOOT_WINDOW_BYTES, true, true)?;
+        let pages = self
+            .map_window_range(boot_window_virt, 0, HIGH_HALF_BOOT_WINDOW_BYTES, true, true)
+            .map_err(|err| remap_conflict(err, VmError::BootWindowConflict))?;
         if pages != 0 {
             report.higher_half_ranges += 1;
             report.higher_half_pages = report.higher_half_pages.saturating_add(pages);
@@ -352,7 +454,9 @@ impl VirtualMemoryManager {
                 ReservedMemoryKind::LoaderImage | ReservedMemoryKind::LowMemory
             );
             if keep_identity {
-                let pages = self.map_identity_range(range.start, range.end(), true, executable)?;
+                let pages = self
+                    .map_identity_range(range.start, range.end(), true, executable)
+                    .map_err(|err| remap_conflict(err, VmError::ReservedIdentityConflict))?;
                 if pages != 0 {
                     report.identity_ranges += 1;
                     report.identity_pages = report.identity_pages.saturating_add(pages);
@@ -360,11 +464,30 @@ impl VirtualMemoryManager {
             }
 
             let window_virt = higher_half_phys(range.start).ok_or(VmError::AddressOverflow)?;
-            let pages =
-                self.map_window_range(window_virt, range.start, range.end(), true, executable)?;
+            let pages = self
+                .map_window_range(window_virt, range.start, range.end(), true, executable)
+                .map_err(|err| remap_conflict(err, VmError::ReservedWindowConflict))?;
             if pages != 0 {
                 report.higher_half_ranges += 1;
                 report.higher_half_pages = report.higher_half_pages.saturating_add(pages);
+            }
+        }
+
+        if let Some((virt_start, page_count, writable, executable)) =
+            kernel_image_span(boot_info)
+        {
+            let pages = self
+                .map_fixed_range(
+                virt_start,
+                boot_info.kernel_image.load_base,
+                page_count as usize,
+                writable,
+                executable,
+            )
+                .map_err(|err| remap_conflict(err, VmError::KernelImageConflict))?;
+            if pages != 0 {
+                report.kernel_image_ranges = 1;
+                report.kernel_image_pages = report.kernel_image_pages.saturating_add(pages);
             }
         }
 
@@ -553,6 +676,24 @@ impl VirtualMemoryManager {
         Ok(self.root.phys_addr)
     }
 
+    fn adopt_active_root(&mut self, root_table_phys: u64) -> Result<u64, VmError> {
+        if root_table_phys % PAGE_SIZE != 0 {
+            return Err(VmError::UnalignedPhysicalAddress);
+        }
+
+        self.root = PageTablePage::new(root_table_phys);
+        self.initialized = true;
+        self.committed = true;
+        self.active = true;
+        self.l3_tables.clear();
+        self.l2_tables.clear();
+        self.l1_tables.clear();
+        self.mappings.clear();
+        self.mapped_pages = 0;
+        self.boot_report = None;
+        Ok(root_table_phys)
+    }
+
     fn sync_pages(&mut self) -> Result<u64, VmError> {
         if !self.initialized {
             return Err(VmError::NotInitialized);
@@ -652,6 +793,13 @@ pub enum VmError {
     NotInitialized,
     InvalidPageCount,
     UnalignedVirtualAddress,
+    UnalignedPhysicalAddress,
+    BootIdentityConflict,
+    BootStackConflict,
+    BootWindowConflict,
+    ReservedIdentityConflict,
+    ReservedWindowConflict,
+    KernelImageConflict,
     AddressOverflow,
     AlreadyMapped,
     OutOfPhysicalPages,
@@ -661,6 +809,8 @@ pub enum VmError {
 pub struct BootVmReport {
     pub identity_ranges: u64,
     pub identity_pages: u64,
+    pub kernel_image_ranges: u64,
+    pub kernel_image_pages: u64,
     pub stack_window_start: u64,
     pub stack_window_pages: u64,
     pub higher_half_ranges: u64,
@@ -703,6 +853,10 @@ pub fn sync() -> Result<u64, VmError> {
 
 pub fn activate() -> Result<u64, VmError> {
     unsafe { (*VM.0.get()).activate() }
+}
+
+pub fn adopt_current_root() -> Result<u64, VmError> {
+    unsafe { (*VM.0.get()).adopt_active_root(read_cr3()) }
 }
 
 pub fn translate(virt: u64) -> Option<u64> {
@@ -796,6 +950,63 @@ fn higher_half_phys(phys: u64) -> Option<u64> {
     HIGH_HALF_DIRECT_MAP_BASE.checked_add(phys)
 }
 
+fn kernel_virtual_holes(boot_info: &BootInfo, start: u64, end: u64) -> Vec<(u64, u64)> {
+    let mut holes = Vec::new();
+    for segment in boot_info.kernel_image.segments() {
+        if segment.load_page_count == 0 || segment.memory_size == 0 {
+            continue;
+        }
+
+        let hole_start = align_down(segment.virtual_address.max(start));
+        let hole_end =
+            align_up(segment.virtual_address.saturating_add(segment.memory_size).min(end));
+        if hole_end > hole_start {
+            holes.push((hole_start, hole_end));
+        }
+    }
+
+    holes.sort_unstable_by_key(|(hole_start, _)| *hole_start);
+    holes
+}
+
+fn kernel_image_span(boot_info: &BootInfo) -> Option<(u64, u64, bool, bool)> {
+    if boot_info.kernel_image.load_page_count == 0 || boot_info.kernel_image.load_base == 0 {
+        return None;
+    }
+
+    let mut virt_start = u64::MAX;
+    let mut writable = false;
+    let mut executable = false;
+    for segment in boot_info.kernel_image.segments() {
+        if segment.load_page_count == 0 || segment.memory_size == 0 {
+            continue;
+        }
+
+        virt_start = virt_start.min(align_down(segment.virtual_address));
+        writable |= segment.flags & KERNEL_SEGMENT_FLAG_WRITE != 0;
+        executable |= segment.flags & KERNEL_SEGMENT_FLAG_EXECUTE != 0;
+    }
+
+    if virt_start == u64::MAX {
+        None
+    } else {
+        Some((
+            virt_start,
+            boot_info.kernel_image.load_page_count,
+            writable,
+            executable,
+        ))
+    }
+}
+
+fn remap_conflict(error: VmError, remapped: VmError) -> VmError {
+    if matches!(error, VmError::AlreadyMapped) {
+        remapped
+    } else {
+        error
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn current_stack_pointer() -> u64 {
     let stack: u64;
@@ -857,6 +1068,24 @@ fn load_cr3(root_table_phys: u64) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_cr3() -> u64 {
+    let root_table_phys: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr3",
+            out(reg) root_table_phys,
+            options(nostack, preserves_flags)
+        );
+    }
+    root_table_phys
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn read_cr3() -> u64 {
+    0
 }
 
 #[cfg(not(target_arch = "x86_64"))]

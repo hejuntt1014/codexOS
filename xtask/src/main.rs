@@ -12,7 +12,7 @@ const EFI_TARGET: &str = "x86_64-unknown-uefi";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const LOADER_BIN: &str = "uefi-loader.efi";
 const KERNEL_BIN: &str = "kernel-image";
-const IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const IMAGE_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum LoaderMode {
@@ -26,73 +26,73 @@ fn main() -> Result<()> {
     match args.next().as_deref() {
         Some("build") => {
             build_loader(false, LoaderMode::Interactive)?;
-            build_kernel_image(false)?;
+            build_kernel_image(true)?;
         }
         Some("build-handoff") => {
             build_loader(false, LoaderMode::Handoff)?;
-            build_kernel_image(false)?;
+            build_kernel_image(true)?;
         }
         Some("build-chainload") => {
             build_loader(false, LoaderMode::Chainload)?;
-            build_kernel_image(false)?;
+            build_kernel_image(true)?;
         }
         Some("image") => {
             let loader = build_loader(false, LoaderMode::Interactive)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Interactive)?;
             println!("disk image ready: {}", image.display());
         }
         Some("image-handoff") => {
             let loader = build_loader(false, LoaderMode::Handoff)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Handoff)?;
             println!("disk image ready: {}", image.display());
         }
         Some("image-chainload") => {
             let loader = build_loader(false, LoaderMode::Chainload)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Chainload)?;
             println!("disk image ready: {}", image.display());
         }
         Some("run") => {
             let loader = build_loader(false, LoaderMode::Interactive)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Interactive)?;
             run_qemu(&image, false)?;
         }
         Some("handoff") => {
             let loader = build_loader(false, LoaderMode::Handoff)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Handoff)?;
             run_qemu(&image, false)?;
         }
         Some("chainload") => {
             let loader = build_loader(false, LoaderMode::Chainload)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Chainload)?;
             run_qemu(&image, false)?;
         }
         Some("debug") => {
             let loader = build_loader(false, LoaderMode::Interactive)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Interactive)?;
             run_qemu(&image, true)?;
         }
         Some("smoke") => {
             let loader = build_loader(false, LoaderMode::Interactive)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Interactive)?;
             smoke_qemu(&image, LoaderMode::Interactive)?;
         }
         Some("smoke-handoff") => {
             let loader = build_loader(false, LoaderMode::Handoff)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Handoff)?;
             smoke_qemu(&image, LoaderMode::Handoff)?;
         }
         Some("smoke-chainload") => {
             let loader = build_loader(false, LoaderMode::Chainload)?;
-            let kernel = build_kernel_image(false)?;
+            let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Chainload)?;
             smoke_qemu(&image, LoaderMode::Chainload)?;
         }
@@ -384,6 +384,11 @@ fn smoke_qemu(image: &Path, mode: LoaderMode) -> Result<()> {
         && !log.contains("standalone boot info present")
     {
         bail!("chainload smoke boot did not enter the standalone kernel; serial output:\n{log}");
+    }
+    if matches!(mode, LoaderMode::Chainload) && !log.contains("standalone desktop rendered") {
+        bail!(
+            "chainload smoke boot did not render the standalone desktop; serial output:\n{log}"
+        );
     }
 
     println!("smoke check passed");

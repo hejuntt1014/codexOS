@@ -2,7 +2,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 64 * 1024 * 1024;
+const HEAP_SIZE: usize = 160 * 1024 * 1024;
 
 #[repr(align(16))]
 struct Heap([u8; HEAP_SIZE]);

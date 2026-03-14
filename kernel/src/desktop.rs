@@ -618,9 +618,11 @@ impl DesktopApp {
                 ));
                 if let Some(report) = snapshot.boot_report {
                     self.terminal.push_line(format!(
-                        "ident={} ranges/{} pages stack=0x{:016x}/{}",
+                        "ident={} ranges/{} pages kernel={} ranges/{} pages stack=0x{:016x}/{}",
                         report.identity_ranges,
                         report.identity_pages,
+                        report.kernel_image_ranges,
+                        report.kernel_image_pages,
                         report.stack_window_start,
                         report.stack_window_pages
                     ));
@@ -652,8 +654,8 @@ impl DesktopApp {
                     .push_line(format!("hhdm base 0x{:016x}", snapshot.hhdm_base));
                 if let Some(report) = snapshot.boot_report {
                     self.terminal.push_line(format!(
-                        "boot layout ident={} hhdm={}",
-                        report.identity_pages, report.higher_half_pages
+                        "boot layout ident={} kernel={} hhdm={}",
+                        report.identity_pages, report.kernel_image_pages, report.higher_half_pages
                     ));
                 }
                 for (index, mapping) in vm::mappings().iter().take(3).enumerate() {
@@ -1242,6 +1244,17 @@ fn describe_vm_error(error: vm::VmError) -> &'static str {
         vm::VmError::NotInitialized => "vm not initialized",
         vm::VmError::InvalidPageCount => "page count must be non-zero",
         vm::VmError::UnalignedVirtualAddress => "virtual address must be page-aligned",
+        vm::VmError::UnalignedPhysicalAddress => "physical address must be page-aligned",
+        vm::VmError::BootIdentityConflict => "boot identity map overlaps an existing mapping",
+        vm::VmError::BootStackConflict => "boot stack map overlaps an existing mapping",
+        vm::VmError::BootWindowConflict => "boot hhdm window overlaps an existing mapping",
+        vm::VmError::ReservedIdentityConflict => {
+            "reserved identity map overlaps an existing mapping"
+        }
+        vm::VmError::ReservedWindowConflict => {
+            "reserved hhdm map overlaps an existing mapping"
+        }
+        vm::VmError::KernelImageConflict => "kernel image map overlaps an existing mapping",
         vm::VmError::AddressOverflow => "address arithmetic overflowed",
         vm::VmError::AlreadyMapped => "virtual range already mapped",
         vm::VmError::OutOfPhysicalPages => "out of physical pages",
