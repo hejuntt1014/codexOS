@@ -141,6 +141,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "heap-allocator"
+version = "0.1.0"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -182,6 +186,7 @@ dependencies = [
  "bootinfo",
  "desktop-runtime",
  "gfx",
+ "heap-allocator",
 ]
 
 [[package]]
@@ -189,7 +194,7 @@ name = "kernel-image"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
- "gfx",
+ "kernel",
 ]
 
 [[package]]
@@ -312,6 +317,7 @@ dependencies = [
  "boot-runtime",
  "bootinfo",
  "desktop-runtime",
+ "heap-allocator",
  "uefi",
  "xmas-elf",
 ]

@@ -6,17 +6,18 @@ extern crate alloc;
 mod allocator;
 
 use alloc::boxed::Box;
-use bootinfo::{
-    BootInfo, FirmwareMode, FrameBufferInfo, KERNEL_SEGMENT_FLAG_EXECUTE,
-    KERNEL_SEGMENT_FLAG_READ, KERNEL_SEGMENT_FLAG_WRITE, KernelImageInfo, KernelImageSegment,
-    MAX_KERNEL_IMAGE_SEGMENTS, MAX_MEMORY_REGIONS, MAX_RESERVED_MEMORY_RANGES, MemoryRegion,
-    MemoryRegionKind, PAGE_SIZE, PixelFormat, ReservedMemoryKind, ReservedMemoryRange,
-};
 use boot_runtime::{activate_post_ebs_vm, init, log_line};
+use bootinfo::{
+    BootInfo, FirmwareMode, FrameBufferInfo, KERNEL_SEGMENT_FLAG_EXECUTE, KERNEL_SEGMENT_FLAG_READ,
+    KERNEL_SEGMENT_FLAG_WRITE, KernelImageInfo, KernelImageSegment, MAX_KERNEL_IMAGE_SEGMENTS,
+    MAX_MEMORY_REGIONS, MAX_RESERVED_MEMORY_RANGES, MemoryRegion, MemoryRegionKind, PAGE_SIZE,
+    PixelFormat, ReservedMemoryKind, ReservedMemoryRange,
+};
 use core::mem;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 use core::time::Duration;
 use desktop_runtime::{DesktopApp, DesktopInput, PointerSample};
+use uefi::CString16;
 use uefi::boot::{self, AllocateType};
 use uefi::fs::FileSystem;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
@@ -25,18 +26,33 @@ use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 use uefi::proto::console::pointer::Pointer;
 use uefi::proto::console::text::{Input, Key, ScanCode};
 use uefi::proto::loaded_image::LoadedImage;
-use uefi::CString16;
 use xmas_elf::ElfFile;
 use xmas_elf::program::Type as ProgramType;
+use xmas_elf::sections::SectionData;
 
 const LOW_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024;
 const RUNTIME_HHDM_BASE: u64 = 0xffff_8000_0000_0000;
+const RUNTIME_HEAP_BYTES: usize = 64 * 1024 * 1024;
+const KERNEL_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
 #[global_allocator]
-static ALLOCATOR: allocator::BumpAllocator = allocator::BumpAllocator;
+static ALLOCATOR: allocator::LoaderHeap = allocator::LoaderHeap::new();
 
 #[entry]
 fn main() -> Status {
+    let runtime_heap = match initialize_runtime_heap() {
+        Some(range) => range,
+        None => return Status::OUT_OF_RESOURCES,
+    };
+    let kernel_heap = if cfg!(feature = "chainload") {
+        match allocate_kernel_heap() {
+            Some(range) => Some(range),
+            None => return Status::OUT_OF_RESOURCES,
+        }
+    } else {
+        None
+    };
+
     let handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(handle) => handle,
         Err(status) => return status.status(),
@@ -58,7 +74,14 @@ fn main() -> Status {
     let kernel_image = load_kernel_image();
 
     if cfg!(feature = "handoff") {
-        return run_handoff_mode(gop, framebuffer, loader_image, kernel_image);
+        return run_handoff_mode(
+            gop,
+            framebuffer,
+            loader_image,
+            kernel_image,
+            runtime_heap,
+            kernel_heap,
+        );
     }
 
     let memory_map = match boot::memory_map(MemoryType::LOADER_DATA) {
@@ -71,6 +94,8 @@ fn main() -> Status {
     collect_reserved_ranges(
         &mut boot_info,
         loader_image,
+        Some(runtime_heap),
+        kernel_heap,
         Some((
             memory_map.buffer().as_ptr() as u64,
             memory_map.buffer().len() as u64,
@@ -78,6 +103,7 @@ fn main() -> Status {
     );
 
     init(&boot_info);
+    log_heap_status();
     log_boot_context(&boot_info);
 
     let input_handle = match boot::get_handle_for_protocol::<Input>() {
@@ -149,11 +175,55 @@ fn main() -> Status {
     Status::SUCCESS
 }
 
+fn initialize_runtime_heap() -> Option<(u64, u64)> {
+    let page_size = PAGE_SIZE as usize;
+    let page_count = RUNTIME_HEAP_BYTES.div_ceil(page_size);
+    let allocation =
+        boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, page_count).ok()?;
+    let capacity = page_count.checked_mul(page_size)?;
+
+    if ALLOCATOR
+        .initialize_external(allocation.as_ptr(), capacity)
+        .is_err()
+    {
+        unsafe {
+            let _ = boot::free_pages(allocation, page_count);
+        }
+        return None;
+    }
+
+    Some((allocation.as_ptr() as u64, capacity as u64))
+}
+
+fn allocate_kernel_heap() -> Option<(u64, u64)> {
+    let page_size = PAGE_SIZE as usize;
+    let page_count = KERNEL_HEAP_BYTES.div_ceil(page_size);
+    let allocation =
+        boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, page_count).ok()?;
+    let capacity = page_count.checked_mul(page_size)?;
+    Some((allocation.as_ptr() as u64, capacity as u64))
+}
+
+fn log_heap_status() {
+    let stats = ALLOCATOR.stats();
+    log_line(format_args!(
+        "heap: capacity={} MiB used={} KiB peak={} KiB free={} MiB live={} failed={}",
+        stats.capacity_bytes / (1024 * 1024),
+        stats.used_bytes / 1024,
+        stats.peak_used_bytes / 1024,
+        stats.free_bytes / (1024 * 1024),
+        stats.live_allocations,
+        stats.failed_allocations
+    ));
+}
+
 fn run_handoff_mode(
     gop: uefi::boot::ScopedProtocol<GraphicsOutput>,
     framebuffer: FrameBufferInfo,
     loader_image: Option<(u64, u64)>,
     kernel_image: KernelImageInfo,
+    runtime_heap: (u64, u64),
+    kernel_heap: Option<(u64, u64)>,
 ) -> Status {
     core::mem::forget(gop);
 
@@ -167,6 +237,8 @@ fn run_handoff_mode(
     collect_reserved_ranges(
         &mut boot_info,
         loader_image,
+        Some(runtime_heap),
+        kernel_heap,
         Some((
             memory_map.buffer().as_ptr() as u64,
             memory_map.buffer().len() as u64,
@@ -175,8 +247,12 @@ fn run_handoff_mode(
     let boot_info = Box::leak(Box::new(boot_info));
 
     init(boot_info);
+    log_heap_status();
     log_boot_context(boot_info);
-    activate_post_ebs_vm(boot_info);
+    if let Err(error) = activate_post_ebs_vm(boot_info) {
+        log_line(format_args!("vm activation failed: {:?}", error));
+        boot_runtime::interrupts::halt();
+    }
 
     if cfg!(feature = "chainload") {
         return chainload_kernel(boot_info);
@@ -241,7 +317,7 @@ fn collect_memory_regions(boot_info: &mut BootInfo, memory_map: &impl MemoryMap)
         }
 
         boot_info.memory_regions[boot_info.memory_region_count] = MemoryRegion {
-            start: descriptor.phys_start as u64,
+            start: descriptor.phys_start,
             page_count: descriptor.page_count,
             kind: map_memory_type(descriptor.ty),
             attributes: descriptor.att.bits(),
@@ -253,6 +329,8 @@ fn collect_memory_regions(boot_info: &mut BootInfo, memory_map: &impl MemoryMap)
 fn collect_reserved_ranges(
     boot_info: &mut BootInfo,
     loader_image: Option<(u64, u64)>,
+    runtime_heap: Option<(u64, u64)>,
+    kernel_heap: Option<(u64, u64)>,
     memory_map_buffer: Option<(u64, u64)>,
 ) {
     push_reserved_range(
@@ -264,6 +342,14 @@ fn collect_reserved_ranges(
 
     if let Some((base, size)) = loader_image {
         push_reserved_range(boot_info, base, size, ReservedMemoryKind::LoaderImage);
+    }
+
+    if let Some((base, size)) = runtime_heap {
+        push_reserved_range(boot_info, base, size, ReservedMemoryKind::RuntimeHeap);
+    }
+
+    if let Some((base, size)) = kernel_heap {
+        push_reserved_range(boot_info, base, size, ReservedMemoryKind::KernelHeap);
     }
 
     push_reserved_range(
@@ -279,8 +365,16 @@ fn collect_reserved_ranges(
 
     if boot_info.kernel_image.load_page_count != 0 {
         let start = align_down(boot_info.kernel_image.load_base);
-        let length = boot_info.kernel_image.load_page_count.saturating_mul(PAGE_SIZE);
-        push_reserved_range(boot_info, start, length, ReservedMemoryKind::KernelImageLoad);
+        let length = boot_info
+            .kernel_image
+            .load_page_count
+            .saturating_mul(PAGE_SIZE);
+        push_reserved_range(
+            boot_info,
+            start,
+            length,
+            ReservedMemoryKind::KernelImageLoad,
+        );
     }
 }
 
@@ -314,14 +408,15 @@ fn log_boot_context(boot_info: &BootInfo) {
     ));
     if boot_info.kernel_image.is_present() {
         log_line(format_args!(
-            "kernel image: {} bytes entry=0x{:016x} staged=0x{:016x} phdrs={} load={}/{} staged={}",
+            "kernel image: {} bytes entry=0x{:016x} staged=0x{:016x} phdrs={} load={}/{} staged={} relocs={}",
             boot_info.kernel_image.image_size,
             boot_info.kernel_image.entry_point,
             boot_info.kernel_image.loaded_entry_point,
             boot_info.kernel_image.program_header_count,
             boot_info.kernel_image.load_segment_count,
             boot_info.kernel_image.load_segment_total,
-            boot_info.kernel_image.loaded_segment_count
+            boot_info.kernel_image.loaded_segment_count,
+            boot_info.kernel_image.relocation_count
         ));
     } else {
         log_line(format_args!("kernel image: unavailable"));
@@ -347,7 +442,9 @@ fn load_kernel_image() -> KernelImageInfo {
         Some(info) => info,
         None => return KernelImageInfo::EMPTY,
     };
-    stage_kernel_segments(&mut info, &bytes);
+    if !stage_kernel_segments(&mut info, &bytes) {
+        return KernelImageInfo::EMPTY;
+    }
     info
 }
 
@@ -363,6 +460,7 @@ fn parse_kernel_image(bytes: &[u8]) -> Option<KernelImageInfo> {
         load_segment_count: 0,
         load_segment_total: 0,
         loaded_segment_count: 0,
+        relocation_count: 0,
         segments: [KernelImageSegment::EMPTY; MAX_KERNEL_IMAGE_SEGMENTS],
     };
 
@@ -413,22 +511,24 @@ fn chainload_kernel(boot_info: &BootInfo) -> Status {
     }
 
     unsafe {
-        let entry_fn: extern "sysv64" fn(*const BootInfo) -> ! =
+        let entry_fn: unsafe extern "sysv64" fn(*const BootInfo) -> ! =
             mem::transmute(entry as usize);
         entry_fn(boot_info as *const BootInfo);
     }
 }
 
-fn stage_kernel_segments(info: &mut KernelImageInfo, bytes: &[u8]) {
-    let Some((image_base, image_page_count, allocation_phys)) =
+fn stage_kernel_segments(info: &mut KernelImageInfo, bytes: &[u8]) -> bool {
+    let Some((image_base, image_page_count, allocation_phys, relocation_count)) =
         stage_kernel_image_span(info.segments(), bytes)
     else {
-        return;
+        return false;
     };
 
     info.load_base = allocation_phys;
     info.load_page_count = image_page_count;
-    info.loaded_entry_point = allocation_phys.saturating_add(info.entry_point.saturating_sub(image_base));
+    info.loaded_entry_point =
+        allocation_phys.saturating_add(info.entry_point.saturating_sub(image_base));
+    info.relocation_count = relocation_count;
 
     for index in 0..info.load_segment_count {
         let segment = info.segments[index];
@@ -436,8 +536,8 @@ fn stage_kernel_segments(info: &mut KernelImageInfo, bytes: &[u8]) {
         let page_offset = segment.virtual_address.saturating_sub(segment_base);
         let span_bytes = align_up(page_offset.saturating_add(segment.memory_size));
         let segment_pages = span_bytes / PAGE_SIZE;
-        let load_address = allocation_phys
-            .saturating_add(segment.virtual_address.saturating_sub(image_base));
+        let load_address =
+            allocation_phys.saturating_add(segment.virtual_address.saturating_sub(image_base));
         info.segments[index] = KernelImageSegment {
             load_address,
             load_page_count: segment_pages,
@@ -445,12 +545,13 @@ fn stage_kernel_segments(info: &mut KernelImageInfo, bytes: &[u8]) {
         };
         info.loaded_segment_count += 1;
     }
+    true
 }
 
 fn stage_kernel_image_span(
     segments: &[KernelImageSegment],
     bytes: &[u8],
-) -> Option<(u64, u64, u64)> {
+) -> Option<(u64, u64, u64, usize)> {
     let mut image_base = u64::MAX;
     let mut image_end = 0_u64;
 
@@ -460,7 +561,9 @@ fn stage_kernel_image_span(
         }
 
         image_base = image_base.min(align_down(segment.virtual_address));
-        image_end = image_end.max(align_up(segment.virtual_address.saturating_add(segment.memory_size)));
+        image_end = image_end.max(align_up(
+            segment.virtual_address.saturating_add(segment.memory_size),
+        ));
     }
     if image_base == u64::MAX || image_end <= image_base {
         return None;
@@ -493,17 +596,62 @@ fn stage_kernel_image_span(
         }
     }
 
-    Some((image_base, page_count, allocation_phys))
+    let relocation_count =
+        apply_kernel_relocations(bytes, image_base, allocation_phys, span_bytes)?;
+    Some((image_base, page_count, allocation_phys, relocation_count))
+}
+
+fn apply_kernel_relocations(
+    bytes: &[u8],
+    image_base: u64,
+    allocation_phys: u64,
+    span_bytes: u64,
+) -> Option<usize> {
+    const R_X86_64_RELATIVE: u32 = 8;
+
+    let elf = ElfFile::new(bytes).ok()?;
+    let mut applied = 0usize;
+    for section in elf.section_iter() {
+        match section.get_data(&elf).ok()? {
+            SectionData::Rela64(relocations) => {
+                for relocation in relocations {
+                    if relocation.get_type() != R_X86_64_RELATIVE
+                        || relocation.get_symbol_table_index() != 0
+                    {
+                        return None;
+                    }
+
+                    let target_offset = relocation.get_offset().checked_sub(image_base)?;
+                    let target_end =
+                        target_offset.checked_add(core::mem::size_of::<u64>() as u64)?;
+                    if target_end > span_bytes {
+                        return None;
+                    }
+                    let target_address = allocation_phys.checked_add(target_offset)?;
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            target_address as *mut u64,
+                            relocation.get_addend(),
+                        );
+                    }
+                    applied = applied.checked_add(1)?;
+                }
+            }
+            SectionData::Rela32(_) => return None,
+            _ => {}
+        }
+    }
+    Some(applied)
 }
 
 fn allocate_kernel_pages(base: u64, page_count: usize) -> Option<core::ptr::NonNull<u8>> {
     let memory_type = uefi::mem::memory_map::MemoryType::LOADER_DATA;
 
-    if base >= LOW_MEMORY_RESERVE_BYTES {
-        if let Ok(pages) = boot::allocate_pages(AllocateType::Address(base), memory_type, page_count)
-        {
-            return Some(pages);
-        }
+    if base >= LOW_MEMORY_RESERVE_BYTES
+        && let Ok(pages) =
+            boot::allocate_pages(AllocateType::Address(base), memory_type, page_count)
+    {
+        return Some(pages);
     }
 
     boot::allocate_pages(AllocateType::AnyPages, memory_type, page_count).ok()

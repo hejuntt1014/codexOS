@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use bootinfo::{
-    BootInfo, KERNEL_SEGMENT_FLAG_EXECUTE, KERNEL_SEGMENT_FLAG_WRITE, PAGE_SIZE,
+    BootInfo, KERNEL_SEGMENT_FLAG_EXECUTE, KERNEL_SEGMENT_FLAG_WRITE, KernelImageInfo, PAGE_SIZE,
     ReservedMemoryKind,
 };
 use core::cell::UnsafeCell;
@@ -173,7 +173,7 @@ impl VirtualMemoryManager {
         if page_count == 0 {
             return Err(VmError::InvalidPageCount);
         }
-        if virt_start % PAGE_SIZE != 0 {
+        if !virt_start.is_multiple_of(PAGE_SIZE) {
             return Err(VmError::UnalignedVirtualAddress);
         }
 
@@ -356,10 +356,10 @@ impl VirtualMemoryManager {
         if page_count == 0 {
             return Ok(0);
         }
-        if virt_start % PAGE_SIZE != 0 {
+        if !virt_start.is_multiple_of(PAGE_SIZE) {
             return Err(VmError::UnalignedVirtualAddress);
         }
-        if phys_start % PAGE_SIZE != 0 {
+        if !phys_start.is_multiple_of(PAGE_SIZE) {
             return Err(VmError::UnalignedPhysicalAddress);
         }
 
@@ -404,6 +404,9 @@ impl VirtualMemoryManager {
             identity_pages: 0,
             kernel_image_ranges: 0,
             kernel_image_pages: 0,
+            kernel_writable_pages: 0,
+            kernel_executable_pages: 0,
+            kernel_wx_pages: 0,
             stack_window_start: 0,
             stack_window_pages: 0,
             higher_half_ranges: 0,
@@ -412,14 +415,9 @@ impl VirtualMemoryManager {
         };
 
         let kernel_holes = kernel_virtual_holes(boot_info, 0, IDENTITY_BOOT_WINDOW_BYTES);
-        let pages = self.map_identity_range_excluding(
-            0,
-            IDENTITY_BOOT_WINDOW_BYTES,
-            &kernel_holes,
-            true,
-            true,
-        )
-        .map_err(|err| remap_conflict(err, VmError::BootIdentityConflict))?;
+        let pages = self
+            .map_identity_range_excluding(0, IDENTITY_BOOT_WINDOW_BYTES, &kernel_holes, true, true)
+            .map_err(|err| remap_conflict(err, VmError::BootIdentityConflict))?;
         if pages != 0 {
             report.identity_ranges += 1;
             report.identity_pages = report.identity_pages.saturating_add(pages);
@@ -440,7 +438,13 @@ impl VirtualMemoryManager {
 
         let boot_window_virt = higher_half_phys(0).ok_or(VmError::AddressOverflow)?;
         let pages = self
-            .map_window_range(boot_window_virt, 0, HIGH_HALF_BOOT_WINDOW_BYTES, true, true)
+            .map_window_range(
+                boot_window_virt,
+                0,
+                HIGH_HALF_BOOT_WINDOW_BYTES,
+                true,
+                false,
+            )
             .map_err(|err| remap_conflict(err, VmError::BootWindowConflict))?;
         if pages != 0 {
             report.higher_half_ranges += 1;
@@ -448,14 +452,21 @@ impl VirtualMemoryManager {
         }
 
         for range in boot_info.reserved_memory() {
-            let executable = !matches!(range.kind, ReservedMemoryKind::FrameBuffer);
-            let keep_identity = matches!(
+            let identity_executable = matches!(
                 range.kind,
                 ReservedMemoryKind::LoaderImage | ReservedMemoryKind::LowMemory
             );
+            let keep_identity = matches!(
+                range.kind,
+                ReservedMemoryKind::LoaderImage
+                    | ReservedMemoryKind::LowMemory
+                    | ReservedMemoryKind::RuntimeHeap
+                    | ReservedMemoryKind::KernelHeap
+                    | ReservedMemoryKind::DescriptorTables
+            );
             if keep_identity {
                 let pages = self
-                    .map_identity_range(range.start, range.end(), true, executable)
+                    .map_identity_range(range.start, range.end(), true, identity_executable)
                     .map_err(|err| remap_conflict(err, VmError::ReservedIdentityConflict))?;
                 if pages != 0 {
                     report.identity_ranges += 1;
@@ -465,7 +476,7 @@ impl VirtualMemoryManager {
 
             let window_virt = higher_half_phys(range.start).ok_or(VmError::AddressOverflow)?;
             let pages = self
-                .map_window_range(window_virt, range.start, range.end(), true, executable)
+                .map_window_range(window_virt, range.start, range.end(), true, false)
                 .map_err(|err| remap_conflict(err, VmError::ReservedWindowConflict))?;
             if pages != 0 {
                 report.higher_half_ranges += 1;
@@ -473,21 +484,27 @@ impl VirtualMemoryManager {
             }
         }
 
-        if let Some((virt_start, page_count, writable, executable)) =
-            kernel_image_span(boot_info)
-        {
+        for mapping in kernel_page_mappings(&boot_info.kernel_image)? {
             let pages = self
                 .map_fixed_range(
-                virt_start,
-                boot_info.kernel_image.load_base,
-                page_count as usize,
-                writable,
-                executable,
-            )
+                    mapping.virt_start,
+                    mapping.phys_start,
+                    mapping.page_count,
+                    mapping.writable,
+                    mapping.executable,
+                )
                 .map_err(|err| remap_conflict(err, VmError::KernelImageConflict))?;
-            if pages != 0 {
-                report.kernel_image_ranges = 1;
-                report.kernel_image_pages = report.kernel_image_pages.saturating_add(pages);
+            report.kernel_image_ranges = report.kernel_image_ranges.saturating_add(1);
+            report.kernel_image_pages = report.kernel_image_pages.saturating_add(pages);
+            if mapping.writable {
+                report.kernel_writable_pages = report.kernel_writable_pages.saturating_add(pages);
+            }
+            if mapping.executable {
+                report.kernel_executable_pages =
+                    report.kernel_executable_pages.saturating_add(pages);
+            }
+            if mapping.writable && mapping.executable {
+                report.kernel_wx_pages = report.kernel_wx_pages.saturating_add(pages);
             }
         }
 
@@ -677,7 +694,7 @@ impl VirtualMemoryManager {
     }
 
     fn adopt_active_root(&mut self, root_table_phys: u64) -> Result<u64, VmError> {
-        if root_table_phys % PAGE_SIZE != 0 {
+        if !root_table_phys.is_multiple_of(PAGE_SIZE) {
             return Err(VmError::UnalignedPhysicalAddress);
         }
 
@@ -790,6 +807,7 @@ impl VirtualMemoryManager {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
+    FirmwareServicesActive,
     NotInitialized,
     InvalidPageCount,
     UnalignedVirtualAddress,
@@ -800,6 +818,7 @@ pub enum VmError {
     ReservedIdentityConflict,
     ReservedWindowConflict,
     KernelImageConflict,
+    KernelWritableExecutable,
     AddressOverflow,
     AlreadyMapped,
     OutOfPhysicalPages,
@@ -811,6 +830,9 @@ pub struct BootVmReport {
     pub identity_pages: u64,
     pub kernel_image_ranges: u64,
     pub kernel_image_pages: u64,
+    pub kernel_writable_pages: u64,
+    pub kernel_executable_pages: u64,
+    pub kernel_wx_pages: u64,
     pub stack_window_start: u64,
     pub stack_window_pages: u64,
     pub higher_half_ranges: u64,
@@ -958,8 +980,12 @@ fn kernel_virtual_holes(boot_info: &BootInfo, start: u64, end: u64) -> Vec<(u64,
         }
 
         let hole_start = align_down(segment.virtual_address.max(start));
-        let hole_end =
-            align_up(segment.virtual_address.saturating_add(segment.memory_size).min(end));
+        let hole_end = align_up(
+            segment
+                .virtual_address
+                .saturating_add(segment.memory_size)
+                .min(end),
+        );
         if hole_end > hole_start {
             holes.push((hole_start, hole_end));
         }
@@ -969,34 +995,97 @@ fn kernel_virtual_holes(boot_info: &BootInfo, start: u64, end: u64) -> Vec<(u64,
     holes
 }
 
-fn kernel_image_span(boot_info: &BootInfo) -> Option<(u64, u64, bool, bool)> {
-    if boot_info.kernel_image.load_page_count == 0 || boot_info.kernel_image.load_base == 0 {
-        return None;
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct KernelPagePermissions {
+    present: bool,
+    writable: bool,
+    executable: bool,
+}
+
+struct KernelPageMapping {
+    virt_start: u64,
+    phys_start: u64,
+    page_count: usize,
+    writable: bool,
+    executable: bool,
+}
+
+fn kernel_page_mappings(info: &KernelImageInfo) -> Result<Vec<KernelPageMapping>, VmError> {
+    if info.load_page_count == 0 || info.load_base == 0 {
+        return Ok(Vec::new());
     }
 
-    let mut virt_start = u64::MAX;
-    let mut writable = false;
-    let mut executable = false;
-    for segment in boot_info.kernel_image.segments() {
+    let image_base = info
+        .segments()
+        .iter()
+        .filter(|segment| segment.load_page_count != 0 && segment.memory_size != 0)
+        .map(|segment| align_down(segment.virtual_address))
+        .min()
+        .ok_or(VmError::KernelImageConflict)?;
+    let page_count = usize::try_from(info.load_page_count).map_err(|_| VmError::AddressOverflow)?;
+    let mut plan = alloc::vec![KernelPagePermissions::default(); page_count];
+
+    for segment in info.segments() {
         if segment.load_page_count == 0 || segment.memory_size == 0 {
             continue;
         }
+        let segment_start = align_down(segment.virtual_address);
+        let first_page = segment_start
+            .checked_sub(image_base)
+            .ok_or(VmError::KernelImageConflict)?
+            / PAGE_SIZE;
+        let first_page = usize::try_from(first_page).map_err(|_| VmError::AddressOverflow)?;
+        let segment_pages =
+            usize::try_from(segment.load_page_count).map_err(|_| VmError::AddressOverflow)?;
+        let end_page = first_page
+            .checked_add(segment_pages)
+            .ok_or(VmError::AddressOverflow)?;
+        if end_page > plan.len() {
+            return Err(VmError::KernelImageConflict);
+        }
 
-        virt_start = virt_start.min(align_down(segment.virtual_address));
-        writable |= segment.flags & KERNEL_SEGMENT_FLAG_WRITE != 0;
-        executable |= segment.flags & KERNEL_SEGMENT_FLAG_EXECUTE != 0;
+        let writable = segment.flags & KERNEL_SEGMENT_FLAG_WRITE != 0;
+        let executable = segment.flags & KERNEL_SEGMENT_FLAG_EXECUTE != 0;
+        for page in &mut plan[first_page..end_page] {
+            page.present = true;
+            page.writable |= writable;
+            page.executable |= executable;
+            if page.writable && page.executable {
+                return Err(VmError::KernelWritableExecutable);
+            }
+        }
     }
 
-    if virt_start == u64::MAX {
-        None
-    } else {
-        Some((
-            virt_start,
-            boot_info.kernel_image.load_page_count,
-            writable,
-            executable,
-        ))
+    let mut mappings = Vec::new();
+    let mut index = 0usize;
+    while index < plan.len() {
+        let permissions = plan[index];
+        if !permissions.present {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < plan.len() && plan[index] == permissions {
+            index += 1;
+        }
+        let page_offset = (start as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(VmError::AddressOverflow)?;
+        mappings.push(KernelPageMapping {
+            virt_start: image_base
+                .checked_add(page_offset)
+                .ok_or(VmError::AddressOverflow)?,
+            phys_start: info
+                .load_base
+                .checked_add(page_offset)
+                .ok_or(VmError::AddressOverflow)?,
+            page_count: index - start,
+            writable: permissions.writable,
+            executable: permissions.executable,
+        });
     }
+    Ok(mappings)
 }
 
 fn remap_conflict(error: VmError, remapped: VmError) -> VmError {
@@ -1090,3 +1179,82 @@ fn read_cr3() -> u64 {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn load_cr3(_root_table_phys: u64) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bootinfo::{
+        KERNEL_SEGMENT_FLAG_EXECUTE, KERNEL_SEGMENT_FLAG_READ, KERNEL_SEGMENT_FLAG_WRITE,
+        KernelImageSegment,
+    };
+
+    fn segment(virtual_address: u64, pages: u64, flags: u32) -> KernelImageSegment {
+        KernelImageSegment {
+            virtual_address,
+            physical_address: virtual_address,
+            file_offset: 0,
+            file_size: pages * PAGE_SIZE,
+            memory_size: pages * PAGE_SIZE,
+            flags,
+            load_address: 0,
+            load_page_count: pages,
+        }
+    }
+
+    #[test]
+    fn builds_distinct_rx_ro_and_rw_kernel_ranges() {
+        let mut image = KernelImageInfo {
+            load_base: 0x10_0000,
+            load_page_count: 4,
+            load_segment_count: 3,
+            load_segment_total: 3,
+            loaded_segment_count: 3,
+            ..KernelImageInfo::EMPTY
+        };
+        image.segments[0] = segment(
+            0x20_0000,
+            2,
+            KERNEL_SEGMENT_FLAG_READ | KERNEL_SEGMENT_FLAG_EXECUTE,
+        );
+        image.segments[1] = segment(0x20_2000, 1, KERNEL_SEGMENT_FLAG_READ);
+        image.segments[2] = segment(
+            0x20_3000,
+            1,
+            KERNEL_SEGMENT_FLAG_READ | KERNEL_SEGMENT_FLAG_WRITE,
+        );
+
+        let mappings = kernel_page_mappings(&image).unwrap();
+        assert_eq!(mappings.len(), 3);
+        assert_eq!(mappings[0].page_count, 2);
+        assert!(mappings[0].executable && !mappings[0].writable);
+        assert!(!mappings[1].executable && !mappings[1].writable);
+        assert!(!mappings[2].executable && mappings[2].writable);
+    }
+
+    #[test]
+    fn rejects_overlapping_writable_and_executable_segments() {
+        let mut image = KernelImageInfo {
+            load_base: 0x10_0000,
+            load_page_count: 3,
+            load_segment_count: 2,
+            load_segment_total: 2,
+            loaded_segment_count: 2,
+            ..KernelImageInfo::EMPTY
+        };
+        image.segments[0] = segment(
+            0x20_0000,
+            2,
+            KERNEL_SEGMENT_FLAG_READ | KERNEL_SEGMENT_FLAG_EXECUTE,
+        );
+        image.segments[1] = segment(
+            0x20_1000,
+            2,
+            KERNEL_SEGMENT_FLAG_READ | KERNEL_SEGMENT_FLAG_WRITE,
+        );
+
+        assert!(matches!(
+            kernel_page_mappings(&image),
+            Err(VmError::KernelWritableExecutable)
+        ));
+    }
+}

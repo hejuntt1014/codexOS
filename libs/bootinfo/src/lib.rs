@@ -110,6 +110,9 @@ pub enum ReservedMemoryKind {
     FrameBuffer = 2,
     MemoryMap = 3,
     KernelImageLoad = 4,
+    RuntimeHeap = 5,
+    KernelHeap = 6,
+    DescriptorTables = 7,
     Unknown = u32::MAX,
 }
 
@@ -121,6 +124,9 @@ impl ReservedMemoryKind {
             Self::FrameBuffer => "framebuffer",
             Self::MemoryMap => "memory-map",
             Self::KernelImageLoad => "kernel-image-load",
+            Self::RuntimeHeap => "runtime-heap",
+            Self::KernelHeap => "kernel-heap",
+            Self::DescriptorTables => "descriptor-tables",
             Self::Unknown => "unknown",
         }
     }
@@ -222,6 +228,7 @@ pub struct KernelImageInfo {
     pub load_segment_count: usize,
     pub load_segment_total: usize,
     pub loaded_segment_count: usize,
+    pub relocation_count: usize,
     pub segments: [KernelImageSegment; MAX_KERNEL_IMAGE_SEGMENTS],
 }
 
@@ -236,6 +243,7 @@ impl KernelImageInfo {
         load_segment_count: 0,
         load_segment_total: 0,
         loaded_segment_count: 0,
+        relocation_count: 0,
         segments: [KernelImageSegment::EMPTY; MAX_KERNEL_IMAGE_SEGMENTS],
     };
 

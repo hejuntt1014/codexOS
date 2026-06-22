@@ -37,19 +37,19 @@ fn main() -> Result<()> {
             build_kernel_image(true)?;
         }
         Some("image") => {
-            let loader = build_loader(false, LoaderMode::Interactive)?;
+            let loader = build_loader(true, LoaderMode::Interactive)?;
             let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Interactive)?;
             println!("disk image ready: {}", image.display());
         }
         Some("image-handoff") => {
-            let loader = build_loader(false, LoaderMode::Handoff)?;
+            let loader = build_loader(true, LoaderMode::Handoff)?;
             let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Handoff)?;
             println!("disk image ready: {}", image.display());
         }
         Some("image-chainload") => {
-            let loader = build_loader(false, LoaderMode::Chainload)?;
+            let loader = build_loader(true, LoaderMode::Chainload)?;
             let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Chainload)?;
             println!("disk image ready: {}", image.display());
@@ -79,19 +79,19 @@ fn main() -> Result<()> {
             run_qemu(&image, true)?;
         }
         Some("smoke") => {
-            let loader = build_loader(false, LoaderMode::Interactive)?;
+            let loader = build_loader(true, LoaderMode::Interactive)?;
             let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Interactive)?;
             smoke_qemu(&image, LoaderMode::Interactive)?;
         }
         Some("smoke-handoff") => {
-            let loader = build_loader(false, LoaderMode::Handoff)?;
+            let loader = build_loader(true, LoaderMode::Handoff)?;
             let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Handoff)?;
             smoke_qemu(&image, LoaderMode::Handoff)?;
         }
         Some("smoke-chainload") => {
-            let loader = build_loader(false, LoaderMode::Chainload)?;
+            let loader = build_loader(true, LoaderMode::Chainload)?;
             let kernel = build_kernel_image(true)?;
             let image = make_image(&loader, &kernel, LoaderMode::Chainload)?;
             smoke_qemu(&image, LoaderMode::Chainload)?;
@@ -108,9 +108,9 @@ fn print_help() {
     println!("  cargo xtask build          - build the interactive UEFI loader plus kernel ELF");
     println!("  cargo xtask build-handoff  - build the handoff UEFI loader plus kernel ELF");
     println!("  cargo xtask build-chainload - build the handoff chainloader plus kernel ELF");
-    println!("  cargo xtask image          - pack an interactive FAT disk image");
-    println!("  cargo xtask image-handoff  - pack a handoff FAT disk image");
-    println!("  cargo xtask image-chainload - pack a chainload FAT disk image");
+    println!("  cargo xtask image          - pack an optimized interactive FAT disk image");
+    println!("  cargo xtask image-handoff  - pack an optimized handoff FAT disk image");
+    println!("  cargo xtask image-chainload - pack an optimized chainload FAT disk image");
     println!("  cargo xtask run            - launch the interactive desktop in QEMU");
     println!("  cargo xtask handoff        - launch the handoff desktop in QEMU");
     println!("  cargo xtask chainload      - launch the standalone kernel chainload path in QEMU");
@@ -190,7 +190,10 @@ fn build_kernel_image(release: bool) -> Result<PathBuf> {
     run(command, "building the standalone kernel image")?;
 
     let profile = if release { "release" } else { "debug" };
-    let output_dir = workspace_root().join("target").join(KERNEL_TARGET).join(profile);
+    let output_dir = workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join(profile);
     let candidates = [
         output_dir.join(KERNEL_BIN),
         output_dir.join(format!("{KERNEL_BIN}.exe")),
@@ -282,9 +285,7 @@ fn create_dir_if_missing(dir: &fatfs::Dir<'_, File>, name: &str) -> Result<()> {
 }
 
 fn run_qemu(image: &Path, debug_wait: bool) -> Result<()> {
-    let qemu = env::var("CODEXOS_QEMU")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("qemu-system-x86_64"));
+    let qemu = discover_qemu()?;
     let ovmf = discover_ovmf()?;
 
     let mut command = Command::new(qemu);
@@ -309,9 +310,7 @@ fn run_qemu(image: &Path, debug_wait: bool) -> Result<()> {
 }
 
 fn smoke_qemu(image: &Path, mode: LoaderMode) -> Result<()> {
-    let qemu = env::var("CODEXOS_QEMU")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("qemu-system-x86_64"));
+    let qemu = discover_qemu()?;
     let ovmf = discover_ovmf()?;
     let serial_log = workspace_root().join("build").join(match mode {
         LoaderMode::Interactive => "serial-interactive.log",
@@ -358,8 +357,7 @@ fn smoke_qemu(image: &Path, mode: LoaderMode) -> Result<()> {
     if log.contains("[PANIC]") || log.contains("panicked at") {
         bail!("smoke boot reached the kernel but then panicked; serial output:\n{log}");
     }
-    if matches!(mode, LoaderMode::Handoff) && !log.contains("boot mode: post-exit-boot-services")
-    {
+    if matches!(mode, LoaderMode::Handoff) && !log.contains("boot mode: post-exit-boot-services") {
         bail!("handoff smoke boot did not reach post-EBS mode; serial output:\n{log}");
     }
     if matches!(mode, LoaderMode::Handoff) && !log.contains("vm switched to kernel page tables") {
@@ -380,15 +378,55 @@ fn smoke_qemu(image: &Path, mode: LoaderMode) -> Result<()> {
             "handoff smoke boot did not report higher-half aliases for reserved handoff objects; serial output:\n{log}"
         );
     }
-    if matches!(mode, LoaderMode::Chainload)
-        && !log.contains("standalone boot info present")
+    if !matches!(mode, LoaderMode::Interactive) && !log.contains("vm kernel permissions:") {
+        bail!("post-EBS smoke boot did not report kernel page permissions; serial output:\n{log}");
+    }
+    if !matches!(mode, LoaderMode::Interactive) && !log.contains(" wx=0") {
+        bail!("post-EBS smoke boot found writable executable kernel pages; serial output:\n{log}");
+    }
+    if !matches!(mode, LoaderMode::Interactive)
+        && !log.contains("interrupts: exception path verified")
     {
+        bail!("post-EBS smoke boot did not verify its exception path; serial output:\n{log}");
+    }
+    if !matches!(mode, LoaderMode::Interactive)
+        && !log.contains("interrupts: gdt=loaded tr=0x0018 idt=loaded")
+    {
+        bail!("post-EBS smoke boot did not load its kernel GDT and TSS; serial output:\n{log}");
+    }
+    if matches!(mode, LoaderMode::Chainload) && !log.contains("standalone boot info present") {
         bail!("chainload smoke boot did not enter the standalone kernel; serial output:\n{log}");
     }
     if matches!(mode, LoaderMode::Chainload) && !log.contains("standalone desktop rendered") {
+        bail!("chainload smoke boot did not render the standalone desktop; serial output:\n{log}");
+    }
+    if matches!(mode, LoaderMode::Chainload)
+        && !log.contains("standalone vm adopted current page tables")
+    {
+        bail!("chainload smoke boot did not adopt the loader page tables; serial output:\n{log}");
+    }
+    if matches!(mode, LoaderMode::Chainload) && !log.contains("standalone heap: capacity=") {
+        bail!("chainload smoke boot did not initialize its reserved heap; serial output:\n{log}");
+    }
+    if matches!(mode, LoaderMode::Chainload) && !log.contains("standalone exception path verified")
+    {
         bail!(
-            "chainload smoke boot did not render the standalone desktop; serial output:\n{log}"
+            "chainload smoke boot did not verify the resident exception path; serial output:\n{log}"
         );
+    }
+    if matches!(mode, LoaderMode::Chainload)
+        && !log.contains("standalone descriptor tables: gdt=true tr=0x0018 idt=true")
+    {
+        bail!(
+            "chainload smoke boot did not load resident descriptor tables; serial output:\n{log}"
+        );
+    }
+    if matches!(mode, LoaderMode::Chainload) && !log.contains("standalone timer interrupts active")
+    {
+        bail!("chainload smoke boot did not activate timer interrupts; serial output:\n{log}");
+    }
+    if matches!(mode, LoaderMode::Chainload) && !has_applied_kernel_relocations(&log) {
+        bail!("chainload smoke boot did not apply kernel ELF relocations; serial output:\n{log}");
     }
 
     println!("smoke check passed");
@@ -396,11 +434,47 @@ fn smoke_qemu(image: &Path, mode: LoaderMode) -> Result<()> {
     Ok(())
 }
 
+fn has_applied_kernel_relocations(log: &str) -> bool {
+    log.lines().any(|line| {
+        line.split_once("relocs=")
+            .and_then(|(_, value)| value.split_whitespace().next())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|count| count != 0)
+    })
+}
+
 fn print_env() -> Result<()> {
     println!("workspace : {}", workspace_root().display());
-    println!("qemu      : {}", which("qemu-system-x86_64")?.display());
+    println!("qemu      : {}", discover_qemu()?.display());
     println!("ovmf      : {}", discover_ovmf()?.display());
     Ok(())
+}
+
+fn discover_qemu() -> Result<PathBuf> {
+    if let Ok(path) = env::var("CODEXOS_QEMU") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!("CODEXOS_QEMU does not point to a file: {}", path.display());
+    }
+
+    if let Ok(path) = which("qemu-system-x86_64") {
+        return Ok(path);
+    }
+
+    let candidates = [
+        r"D:\Program Files\qemu\qemu-system-x86_64.exe",
+        r"C:\Program Files\qemu\qemu-system-x86_64.exe",
+    ];
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    bail!("could not find qemu-system-x86_64; set CODEXOS_QEMU to the executable path")
 }
 
 fn discover_ovmf() -> Result<PathBuf> {

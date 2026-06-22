@@ -7,4 +7,10 @@ authors.workspace = true
 
 [dependencies]
 bootinfo.workspace = true
-gfx.workspace = true
+kernel.workspace = true
+
+[[bin]]
+name = "kernel-image"
+path = "src/main.rs"
+test = false
+bench = false

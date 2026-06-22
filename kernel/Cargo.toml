@@ -10,6 +10,7 @@ boot-runtime.workspace = true
 bootinfo.workspace = true
 desktop-runtime.workspace = true
 gfx.workspace = true
+heap-allocator.workspace = true
 
 [lib]
 path = "src/lib.rs"

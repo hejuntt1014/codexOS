@@ -7,6 +7,7 @@ members = [
     "libs/boot-runtime",
     "libs/bootinfo",
     "libs/gfx",
+    "libs/heap-allocator",
     "xtask",
 ]
 default-members = ["xtask"]
@@ -25,6 +26,7 @@ desktop-runtime = { path = "libs/desktop-runtime" }
 fatfs = "0.3.6"
 font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
 gfx = { path = "libs/gfx" }
+heap-allocator = { path = "libs/heap-allocator" }
 kernel = { path = "kernel" }
 uefi = "0.36.1"
 xmas-elf = "0.10.0"

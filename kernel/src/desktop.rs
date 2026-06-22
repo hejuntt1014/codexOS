@@ -2,9 +2,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use bootinfo::{
-    BootInfo, FirmwareMode, FrameBufferInfo, KERNEL_SEGMENT_FLAG_EXECUTE,
-    KERNEL_SEGMENT_FLAG_READ, KERNEL_SEGMENT_FLAG_WRITE, KernelImageInfo, KernelImageSegment,
-    MemoryRegion, ReservedMemoryRange,
+    BootInfo, FirmwareMode, FrameBufferInfo, KERNEL_SEGMENT_FLAG_EXECUTE, KERNEL_SEGMENT_FLAG_READ,
+    KERNEL_SEGMENT_FLAG_WRITE, KernelImageInfo, KernelImageSegment, MemoryRegion,
+    ReservedMemoryRange,
 };
 use gfx::{Canvas, Color, blit_buffer_to_framebuffer};
 
@@ -233,10 +233,8 @@ impl DesktopApp {
             DesktopInput::CycleFocus => self.cycle_focus(),
             DesktopInput::Exit => self.should_exit = true,
             DesktopInput::Backspace => {
-                if self.focused_window == TERMINAL_WINDOW {
-                    if self.terminal.input.pop().is_some() {
-                        self.dirty = true;
-                    }
+                if self.focused_window == TERMINAL_WINDOW && self.terminal.input.pop().is_some() {
+                    self.dirty = true;
                 }
             }
             DesktopInput::Submit => {
@@ -277,12 +275,12 @@ impl DesktopApp {
             }
         }
 
-        if let Some(window_index) = self.dragging_window {
-            if sample.left_button {
-                let x = self.cursor_x - self.drag_offset_x;
-                let y = self.cursor_y - self.drag_offset_y;
-                self.move_window_to(window_index, x, y);
-            }
+        if let Some(window_index) = self.dragging_window
+            && sample.left_button
+        {
+            let x = self.cursor_x - self.drag_offset_x;
+            let y = self.cursor_y - self.drag_offset_y;
+            self.move_window_to(window_index, x, y);
         }
 
         if left_just_released {
@@ -1101,7 +1099,10 @@ fn format_reserved_line(index: usize, range: ReservedMemoryRange) -> String {
 
 fn format_kernel_card(info: KernelImageInfo) -> String {
     if info.is_present() {
-        format!("staged {}/{}", info.loaded_segment_count, info.load_segment_total)
+        format!(
+            "staged {}/{}",
+            info.loaded_segment_count, info.load_segment_total
+        )
     } else {
         String::from("missing")
     }
@@ -1188,13 +1189,13 @@ fn format_vm_stats() -> String {
 }
 
 fn runtime_framebuffer(framebuffer: FrameBufferInfo) -> FrameBufferInfo {
-    if vm::stats().active {
-        if let Some(mapped) = vm::physical_to_high_half(framebuffer.base as u64) {
-            return FrameBufferInfo {
-                base: mapped as *mut u8,
-                ..framebuffer
-            };
-        }
+    if vm::stats().active
+        && let Some(mapped) = vm::physical_to_high_half(framebuffer.base as u64)
+    {
+        return FrameBufferInfo {
+            base: mapped as *mut u8,
+            ..framebuffer
+        };
     }
 
     framebuffer
@@ -1241,6 +1242,7 @@ fn format_mapping_line(index: usize, mapping: vm::Mapping) -> String {
 
 fn describe_vm_error(error: vm::VmError) -> &'static str {
     match error {
+        vm::VmError::FirmwareServicesActive => "firmware boot services are still active",
         vm::VmError::NotInitialized => "vm not initialized",
         vm::VmError::InvalidPageCount => "page count must be non-zero",
         vm::VmError::UnalignedVirtualAddress => "virtual address must be page-aligned",
@@ -1251,10 +1253,9 @@ fn describe_vm_error(error: vm::VmError) -> &'static str {
         vm::VmError::ReservedIdentityConflict => {
             "reserved identity map overlaps an existing mapping"
         }
-        vm::VmError::ReservedWindowConflict => {
-            "reserved hhdm map overlaps an existing mapping"
-        }
+        vm::VmError::ReservedWindowConflict => "reserved hhdm map overlaps an existing mapping",
         vm::VmError::KernelImageConflict => "kernel image map overlaps an existing mapping",
+        vm::VmError::KernelWritableExecutable => "kernel image contains a writable executable page",
         vm::VmError::AddressOverflow => "address arithmetic overflowed",
         vm::VmError::AlreadyMapped => "virtual range already mapped",
         vm::VmError::OutOfPhysicalPages => "out of physical pages",

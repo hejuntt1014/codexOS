@@ -22,6 +22,13 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// Creates a drawing surface over a firmware-provided framebuffer.
+    ///
+    /// # Safety
+    ///
+    /// `info.base` must remain valid and writable for at least `info.size`
+    /// bytes for the lifetime of the returned canvas. No other writer may
+    /// access the framebuffer while a drawing operation is in progress.
     pub unsafe fn from_framebuffer(info: FrameBufferInfo) -> Self {
         Self { info }
     }
@@ -235,7 +242,7 @@ impl Canvas {
         for (row_index, row_bits) in glyph.iter().enumerate() {
             for col_index in 0..8 {
                 if (row_bits >> col_index) & 1 == 1 {
-                    let px = x + (col_index as i32 * scale);
+                    let px = x + (col_index * scale);
                     let py = y + (row_index as i32 * scale);
                     self.fill_rect(px, py, scale, scale, color);
                 }

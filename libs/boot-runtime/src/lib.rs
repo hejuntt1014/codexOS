@@ -61,7 +61,13 @@ pub fn init(boot_info: &BootInfo) {
     ));
     let interrupt_status = interrupts::status();
     log_line(format_args!(
-        "interrupts: idt={} hw={} ticks={} hz={}",
+        "interrupts: gdt={} tr=0x{:04x} idt={} hw={} ticks={} hz={}",
+        if interrupt_status.gdt_loaded {
+            "loaded"
+        } else {
+            "firmware"
+        },
+        interrupt_status.task_register,
         if idt_loaded || interrupt_status.idt_loaded {
             "loaded"
         } else {
@@ -90,86 +96,86 @@ pub fn init(boot_info: &BootInfo) {
     }
 }
 
-pub fn activate_post_ebs_vm(boot_info: &BootInfo) {
+pub fn activate_post_ebs_vm(boot_info: &BootInfo) -> Result<u64, vm::VmError> {
     if !matches!(boot_info.firmware_mode, FirmwareMode::PostExitBootServices) {
-        log_line(format_args!(
-            "vm activation skipped: still under boot services"
-        ));
-        return;
+        return Err(vm::VmError::FirmwareServicesActive);
     }
 
     log_line(format_args!("vm activation: preparing boot map"));
-    match vm::prepare_boot_identity_map(boot_info) {
-        Ok(report) => log_line(format_args!(
-            "vm boot map: ident={} ranges/{} pages kernel={} ranges/{} pages stack=0x{:016x}/{} pages hhdm={} ranges/{} pages @ 0x{:016x}",
-            report.identity_ranges,
-            report.identity_pages,
-            report.kernel_image_ranges,
-            report.kernel_image_pages,
-            report.stack_window_start,
-            report.stack_window_pages,
-            report.higher_half_ranges,
-            report.higher_half_pages,
-            report.higher_half_base
-        )),
-        Err(err) => {
-            log_line(format_args!("vm boot map failed: {:?}", err));
-            return;
-        }
-    }
+    let report = vm::prepare_boot_identity_map(boot_info)?;
+    log_line(format_args!(
+        "vm boot map: ident={} ranges/{} pages kernel={} ranges/{} pages stack=0x{:016x}/{} pages hhdm={} ranges/{} pages @ 0x{:016x}",
+        report.identity_ranges,
+        report.identity_pages,
+        report.kernel_image_ranges,
+        report.kernel_image_pages,
+        report.stack_window_start,
+        report.stack_window_pages,
+        report.higher_half_ranges,
+        report.higher_half_pages,
+        report.higher_half_base
+    ));
+    log_line(format_args!(
+        "vm kernel permissions: writable={} executable={} wx={}",
+        report.kernel_writable_pages, report.kernel_executable_pages, report.kernel_wx_pages
+    ));
 
-    match vm::activate() {
-        Ok(root) => {
-            boot::record_post_ebs_active(boot_info, root);
-            log_line(format_args!(
-                "vm switched to kernel page tables at 0x{:016x}",
-                root
-            ));
-            let interrupt_status = interrupts::status();
-            log_line(format_args!(
-                "interrupts: hw=deferred ticks={} hz={}",
-                interrupt_status.ticks,
-                interrupt_status.timer_hz
-            ));
-            let snapshot = boot::snapshot();
-            match snapshot.hhdm_probe {
-                Some(probe) => log_line(format_args!(
-                    "vm hhdm probe: root=0x{:016x} entry0=0x{:016x}",
-                    probe.virt_addr, probe.root_entry0
-                )),
-                None => log_line(format_args!("vm hhdm probe unavailable")),
-            }
-            if let Some(framebuffer) = snapshot.framebuffer_alias {
-                log_line(format_args!(
-                    "vm framebuffer hhdm: phys=0x{:016x} virt=0x{:016x}",
-                    boot_info.framebuffer.base as u64, framebuffer
-                ));
-            }
-            log_line(format_args!(
-                "vm reserved hhdm: loader={} memmap={}",
-                format_reserved_alias(snapshot.loader_alias),
-                format_reserved_alias(snapshot.memory_map_alias)
-            ));
-        }
-        Err(err) => log_line(format_args!("vm activation failed: {:?}", err)),
+    let root = vm::activate()?;
+    boot::record_post_ebs_active(boot_info, root);
+    log_line(format_args!(
+        "vm switched to kernel page tables at 0x{:016x}",
+        root
+    ));
+    if !interrupts::verify_exception_path() {
+        log_line(format_args!(
+            "interrupts: exception path verification failed"
+        ));
+        interrupts::halt();
     }
+    log_line(format_args!("interrupts: exception path verified"));
+    let interrupt_status = interrupts::status();
+    log_line(format_args!(
+        "interrupts: hw=deferred ticks={} hz={}",
+        interrupt_status.ticks, interrupt_status.timer_hz
+    ));
+    let snapshot = boot::snapshot();
+    match snapshot.hhdm_probe {
+        Some(probe) => log_line(format_args!(
+            "vm hhdm probe: root=0x{:016x} entry0=0x{:016x}",
+            probe.virt_addr, probe.root_entry0
+        )),
+        None => log_line(format_args!("vm hhdm probe unavailable")),
+    }
+    if let Some(framebuffer) = snapshot.framebuffer_alias {
+        log_line(format_args!(
+            "vm framebuffer hhdm: phys=0x{:016x} virt=0x{:016x}",
+            boot_info.framebuffer.base as u64, framebuffer
+        ));
+    }
+    log_line(format_args!(
+        "vm reserved hhdm: loader={} memmap={}",
+        format_reserved_alias(snapshot.loader_alias),
+        format_reserved_alias(snapshot.memory_map_alias)
+    ));
+    Ok(root)
 }
 
-pub fn adopt_current_post_ebs_vm(boot_info: &BootInfo) {
+pub fn adopt_current_post_ebs_vm(boot_info: &BootInfo) -> Result<u64, vm::VmError> {
+    if !matches!(boot_info.firmware_mode, FirmwareMode::PostExitBootServices) {
+        return Err(vm::VmError::FirmwareServicesActive);
+    }
+
     memory::init(boot_info);
     interrupts::init_idt();
     boot::record_firmware_entry();
 
-    match vm::adopt_current_root() {
-        Ok(root) => {
-            boot::record_post_ebs_active(boot_info, root);
-            log_line(format_args!(
-                "standalone vm adopted current page tables at 0x{:016x}",
-                root
-            ));
-        }
-        Err(err) => log_line(format_args!("standalone vm adopt failed: {:?}", err)),
-    }
+    let root = vm::adopt_current_root()?;
+    boot::record_post_ebs_active(boot_info, root);
+    log_line(format_args!(
+        "standalone vm adopted current page tables at 0x{:016x}",
+        root
+    ));
+    Ok(root)
 }
 
 fn format_reserved_alias(alias: Option<boot::ReservedAlias>) -> String {
@@ -182,7 +188,7 @@ fn format_reserved_alias(alias: Option<boot::ReservedAlias>) -> String {
             alias.virt,
             alias.range.length / 1024
         ),
-        None => format!("n/a"),
+        None => String::from("n/a"),
     }
 }
 

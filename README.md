@@ -16,16 +16,22 @@ The repository currently implements:
 - a `uefi-loader` boot image for `x86_64-unknown-uefi`
 - a separate `kernel-image` ELF built for `x86_64-unknown-none` and packed into the boot disk as `KERNEL.ELF`
 - an alternate `handoff` loader mode that exits UEFI boot services before rendering the desktop
-- a `chainload` validation mode that stages the standalone kernel at its linked address, switches to the boot VM, and jumps into the standalone entry point
+- a resident `chainload` mode that stages the standalone kernel, switches to kernel page tables, transfers ownership of a reserved 64 MiB kernel heap, and jumps into the standalone entry point
 - a shared `boot-runtime` layer that now owns early serial logging, physical-page discovery, boot-state tracking, and boot-VM activation for both the loader and the resident kernel path
 - a shared `desktop-runtime` layer that now owns the GUI desktop loop, so `uefi-loader` no longer links the resident `kernel` crate just to render the desktop
-- a `kernel` crate with a simple bump allocator, physical page allocator, and stateful desktop runtime
-- a loader-side ELF inspection and staging step that parses the standalone kernel image, allocates pages for its `PT_LOAD` segments, copies them into memory, and surfaces the staged entry point in boot info, logs, and the desktop shell
-- an early virtual-memory manager that allocates page-table pages, tracks demo mappings, syncs them into physical memory, activates a handoff page table via `CR3`, verifies a boot-time higher-half direct-map window, and trims the post-handoff identity map to a small boot footprint
+- a shared reclaiming heap allocator with aligned allocation, deallocation, free-block coalescing, exhaustion accounting, and host-side tests
+- a 512 KiB loader bootstrap heap that switches to a UEFI-allocated 64 MiB runtime heap without inflating the EFI executable
+- a `kernel` crate with a reclaiming global heap, physical page allocator, and stateful desktop runtime
+- a loader-side ELF64 loader that stages `PT_LOAD` segments, applies checked `R_X86_64_RELATIVE` relocations, rejects unsupported relocations, and records the staged entry point and relocation count in boot info
+- an early virtual-memory manager that activates handoff page tables via `CR3`, verifies a boot-time higher-half direct map, maps HHDM memory non-executable, applies per-page ELF permissions, rejects writable-executable kernel pages, and trims identity mappings to the reserved boot footprint
 - a shared `bootinfo` crate for framebuffer, boot-state, reserved-memory, and compact memory-map handoff
 - a `gfx` crate for primitive 2D drawing plus bitmap text rendering
 - an `xtask` runner for build/image/run/debug workflows
 - a live desktop loop with keyboard focus movement and mouse dragging
+- a tested PS/2 Set-1 keyboard decoder for the firmware-detached kernel, including modifiers, printable keys, controls, and extended arrows
+- a 100 Hz PIT timer and interrupt-driven `hlt` idle path in the resident kernel
+- kernel-owned GDT and TSS state with a dedicated 64 KiB IST stack for double faults, independent of firmware descriptor tables
+- correct stubs for all 32 architectural exception vectors, page-fault access diagnostics, and a boot-time breakpoint/`iretq` self-test across both UEFI and SysV calling conventions
 - a terminal window with command input, history, and built-in shell commands
 - a loader-collected UEFI memory map surfaced in the kernel, inspector, and shell
 
@@ -57,7 +63,7 @@ cargo xtask smoke-chainload
 - `Backspace`: delete one character
 - Mouse left button: drag a window by its title bar
 - Mouse right button: switch focus
-- `Esc`: exit back to firmware
+- `Esc`: exit back to firmware in interactive UEFI mode; halt safely after firmware services have ended
 
 ## Shell commands
 
@@ -92,13 +98,8 @@ cargo xtask smoke-chainload
 - `about`
 - `exit`
 
-## Next milestones
+## Commercial-readiness boundary
 
-1. Replace the bump allocator with a real heap manager and make VM mappings back real page tables.
-2. Replace the chainload validation path with a full standalone-kernel handoff that does not rely on the current kernel crate staying resident.
-3. Add PS/2 or HID input drivers so interaction survives after leaving UEFI services.
-4. Replace the mirrored page-table model with a richer mapped-kernel address space.
-5. Add a higher-half kernel layout instead of relying on temporary identity mappings.
-6. Add a task model, syscall ABI, and user-space apps.
+This repository is a real bootable system, but it is not yet suitable for production deployment. Its kernel image has enforced W^X page permissions and the release images pass real UEFI/QEMU smoke boots, but it still lacks process isolation and a syscall ABI, persistent storage and a filesystem driver, networking, a complete hardware abstraction layer, an installer and recovery environment, signed updates, and a security maintenance process. The standalone chainload path has PS/2 keyboard polling, while general HID and post-firmware pointer input are not implemented.
 
 See `docs/debugging.md` for the debugging workflow.

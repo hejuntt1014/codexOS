@@ -14,5 +14,12 @@ chainload = []
 boot-runtime.workspace = true
 bootinfo.workspace = true
 desktop-runtime.workspace = true
+heap-allocator.workspace = true
 uefi = { workspace = true, features = ["alloc", "panic_handler"] }
 xmas-elf.workspace = true
+
+[[bin]]
+name = "uefi-loader"
+path = "src/main.rs"
+test = false
+bench = false
