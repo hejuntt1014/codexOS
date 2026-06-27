@@ -1,9 +1,19 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod allocator;
+pub mod block;
+pub mod fs;
+pub mod hardware;
 pub mod input;
+pub mod network;
+pub mod process;
+#[cfg(target_os = "none")]
+pub mod scheduler;
+pub mod user_elf;
 
 pub use boot_runtime::{boot, interrupts, memory, serial, vm};
 pub use desktop_runtime::{DesktopApp, DesktopInput, PointerSample};
@@ -11,14 +21,18 @@ pub use desktop_runtime::{DesktopApp, DesktopInput, PointerSample};
 use bootinfo::{BootInfo, ReservedMemoryKind};
 use heap_allocator::HeapInitError;
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: allocator::KernelHeap = allocator::KernelHeap::new();
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: std::alloc::System = std::alloc::System;
 
 pub fn init(boot_info: &BootInfo) {
     boot_runtime::init(boot_info);
 }
 
-pub fn activate_post_ebs_vm(boot_info: &BootInfo) -> Result<u64, vm::VmError> {
+pub fn activate_post_ebs_vm(boot_info: &mut BootInfo) -> Result<u64, vm::VmError> {
     boot_runtime::activate_post_ebs_vm(boot_info)
 }
 

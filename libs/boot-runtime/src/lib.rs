@@ -18,7 +18,7 @@ pub mod interrupts;
 pub mod boot;
 
 use alloc::string::String;
-use bootinfo::{BootInfo, FirmwareMode};
+use bootinfo::{BootInfo, FirmwareMode, ReservedMemoryKind};
 
 pub fn init(boot_info: &BootInfo) {
     serial::init();
@@ -96,13 +96,26 @@ pub fn init(boot_info: &BootInfo) {
     }
 }
 
-pub fn activate_post_ebs_vm(boot_info: &BootInfo) -> Result<u64, vm::VmError> {
+pub fn activate_post_ebs_vm(boot_info: &mut BootInfo) -> Result<u64, vm::VmError> {
     if !matches!(boot_info.firmware_mode, FirmwareMode::PostExitBootServices) {
         return Err(vm::VmError::FirmwareServicesActive);
     }
 
     log_line(format_args!("vm activation: preparing boot map"));
     let report = vm::prepare_boot_identity_map(boot_info)?;
+    let allocated_ranges = memory::allocated_ranges();
+    let mut reserved_page_table_bytes = 0_u64;
+    for (start, length) in allocated_ranges.iter().copied() {
+        if !boot_info.reserve_memory(start, length, ReservedMemoryKind::PageTables) {
+            return Err(vm::VmError::ReservedRangeCapacity);
+        }
+        reserved_page_table_bytes = reserved_page_table_bytes.saturating_add(length);
+    }
+    log_line(format_args!(
+        "vm ownership: reserved {} page-table ranges/{} KiB",
+        allocated_ranges.len(),
+        reserved_page_table_bytes / 1024
+    ));
     log_line(format_args!(
         "vm boot map: ident={} ranges/{} pages kernel={} ranges/{} pages stack=0x{:016x}/{} pages hhdm={} ranges/{} pages @ 0x{:016x}",
         report.identity_ranges,

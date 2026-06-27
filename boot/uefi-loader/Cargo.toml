@@ -13,8 +13,11 @@ chainload = []
 [dependencies]
 boot-runtime.workspace = true
 bootinfo.workspace = true
+codex-release.workspace = true
 desktop-runtime.workspace = true
+ed25519-dalek.workspace = true
 heap-allocator.workspace = true
+sha2.workspace = true
 uefi = { workspace = true, features = ["alloc", "panic_handler"] }
 xmas-elf.workspace = true
 

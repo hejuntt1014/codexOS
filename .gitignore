@@ -1,6 +1,8 @@
 /target
 /build/*.img
 /build/*.log
+/build/*.pcap
 /build/*.fd
 /build/*.efi
+/build/*.bin
 

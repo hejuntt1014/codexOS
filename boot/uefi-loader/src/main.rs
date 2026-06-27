@@ -13,11 +13,16 @@ use bootinfo::{
     MAX_MEMORY_REGIONS, MAX_RESERVED_MEMORY_RANGES, MemoryRegion, MemoryRegionKind, PAGE_SIZE,
     PixelFormat, ReservedMemoryKind, ReservedMemoryRange,
 };
-use core::mem;
+use codex_release::{
+    BootState, KEY_ID_BYTES, ManifestError, PUBLIC_KEY_BYTES, SystemSlot, TRUST_ROOT_STATE_BYTES,
+    TrustRootState, UpdateManifest,
+};
 use core::ptr::{copy_nonoverlapping, write_bytes};
 use core::time::Duration;
+use core::{fmt, mem};
 use desktop_runtime::{DesktopApp, DesktopInput, PointerSample};
-use uefi::CString16;
+use ed25519_dalek::{Signature, VerifyingKey};
+use sha2::{Digest, Sha256};
 use uefi::boot::{self, AllocateType};
 use uefi::fs::FileSystem;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
@@ -26,6 +31,8 @@ use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 use uefi::proto::console::pointer::Pointer;
 use uefi::proto::console::text::{Input, Key, ScanCode};
 use uefi::proto::loaded_image::LoadedImage;
+use uefi::runtime::{self, VariableAttributes, VariableVendor};
+use uefi::{CString16, guid};
 use xmas_elf::ElfFile;
 use xmas_elf::program::Type as ProgramType;
 use xmas_elf::sections::SectionData;
@@ -34,12 +41,15 @@ const LOW_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024;
 const RUNTIME_HHDM_BASE: u64 = 0xffff_8000_0000_0000;
 const RUNTIME_HEAP_BYTES: usize = 64 * 1024 * 1024;
 const KERNEL_HEAP_BYTES: usize = 64 * 1024 * 1024;
+const CODEXOS_VARIABLE_VENDOR: VariableVendor =
+    VariableVendor(guid!("38d5e429-307f-4f7a-9d27-bd21d55f4b92"));
 
 #[global_allocator]
 static ALLOCATOR: allocator::LoaderHeap = allocator::LoaderHeap::new();
 
 #[entry]
 fn main() -> Status {
+    boot_runtime::serial::init();
     let runtime_heap = match initialize_runtime_heap() {
         Some(range) => range,
         None => return Status::OUT_OF_RESOURCES,
@@ -71,7 +81,13 @@ fn main() -> Status {
         }
         Err(status) => return status.status(),
     };
-    let kernel_image = load_kernel_image();
+    let kernel_image = match load_kernel_image() {
+        Ok(image) => image,
+        Err(error) => {
+            log_line(format_args!("kernel security failure: {:?}", error));
+            return Status::SECURITY_VIOLATION;
+        }
+    };
 
     if cfg!(feature = "handoff") {
         return run_handoff_mode(
@@ -418,40 +434,462 @@ fn log_boot_context(boot_info: &BootInfo) {
             boot_info.kernel_image.loaded_segment_count,
             boot_info.kernel_image.relocation_count
         ));
+        let key_id = boot_info.kernel_image.verification_key_id;
+        let hash = boot_info.kernel_image.kernel_sha256;
+        let slot = if boot_info.kernel_image.system_slot == 0 {
+            "A"
+        } else {
+            "B"
+        };
+        log_line(format_args!(
+            "kernel signature: verified={} version={} slot={} state-gen={} recovery={} key-id={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} sha256-prefix={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            boot_info.kernel_image.signature_verified == 1,
+            boot_info.kernel_image.release_version,
+            slot,
+            boot_info.kernel_image.boot_state_generation,
+            boot_info.kernel_image.recovery_fallback == 1,
+            key_id[0],
+            key_id[1],
+            key_id[2],
+            key_id[3],
+            key_id[4],
+            key_id[5],
+            key_id[6],
+            key_id[7],
+            key_id[8],
+            key_id[9],
+            key_id[10],
+            key_id[11],
+            key_id[12],
+            key_id[13],
+            key_id[14],
+            key_id[15],
+            hash[0],
+            hash[1],
+            hash[2],
+            hash[3],
+            hash[4],
+            hash[5],
+            hash[6],
+            hash[7]
+        ));
     } else {
         log_line(format_args!("kernel image: unavailable"));
     }
 }
 
-fn load_kernel_image() -> KernelImageInfo {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelLoadError {
+    FileSystemUnavailable,
+    BootStateUnavailable,
+    InvalidPath,
+    KernelReadFailed,
+    ManifestReadFailed,
+    ManifestInvalid(ManifestError),
+    KernelSizeMismatch,
+    KernelHashMismatch,
+    TrustedKeyUnavailable,
+    PersistedTrustRootInvalid,
+    PersistedTrustRootUnavailable,
+    NextTrustKeyInvalid,
+    NextTrustKeyIdMismatch,
+    TrustRootUpdateFailed,
+    KeyIdMismatch,
+    SignatureInvalid,
+    RollbackStateUnavailable,
+    RollbackDetected { candidate: u64, minimum: u64 },
+    BootStateReleaseMismatch,
+    BothSystemSlotsUnavailable,
+    InvalidElf,
+    StagingFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustRootSource {
+    Embedded,
+    Persisted,
+}
+
+impl TrustRootSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Persisted => "persisted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrustRoot {
+    public_key: [u8; PUBLIC_KEY_BYTES],
+    key_id: [u8; KEY_ID_BYTES],
+    source: TrustRootSource,
+    activation_release_version: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedRelease {
+    trust_root: TrustRoot,
+}
+
+struct HexBytes<'a>(&'a [u8]);
+
+impl fmt::Display for HexBytes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+fn load_kernel_image() -> Result<KernelImageInfo, KernelLoadError> {
     let fs = match boot::get_image_file_system(boot::image_handle()) {
         Ok(fs) => fs,
-        Err(_) => return KernelImageInfo::EMPTY,
+        Err(_) => return Err(KernelLoadError::FileSystemUnavailable),
     };
     let mut fs = FileSystem::new(fs);
-    let path = match CString16::try_from("\\KERNEL.ELF") {
-        Ok(path) => path,
-        Err(_) => return KernelImageInfo::EMPTY,
+    let state = match load_boot_state(&mut fs) {
+        Ok(state) => state,
+        Err(KernelLoadError::BootStateUnavailable) => {
+            return recover_from_missing_boot_state(&mut fs);
+        }
+        Err(error) => return Err(error),
     };
-    let bytes = match fs.read(path.as_ref()) {
-        Ok(bytes) => bytes,
-        Err(_) => return KernelImageInfo::EMPTY,
+    match load_system_slot(&mut fs, state.active_slot) {
+        Ok(mut image) if image.release_version == state.active_release_version => {
+            image.boot_state_generation = state.generation;
+            image.system_slot = state.active_slot.as_u8();
+            return Ok(image);
+        }
+        Ok(_) => log_line(format_args!(
+            "system slot {} rejected: {:?}",
+            state.active_slot.as_str(),
+            KernelLoadError::BootStateReleaseMismatch
+        )),
+        Err(error) => log_line(format_args!(
+            "system slot {} rejected: {:?}",
+            state.active_slot.as_str(),
+            error
+        )),
+    }
+
+    let fallback = state.active_slot.other();
+    match load_system_slot(&mut fs, fallback) {
+        Ok(mut image) => {
+            image.boot_state_generation = state.generation;
+            image.system_slot = fallback.as_u8();
+            image.recovery_fallback = 1;
+            log_line(format_args!(
+                "system recovery fallback: active={} selected={} version={}",
+                state.active_slot.as_str(),
+                fallback.as_str(),
+                image.release_version
+            ));
+            Ok(image)
+        }
+        Err(error) => {
+            log_line(format_args!(
+                "system slot {} rejected: {:?}",
+                fallback.as_str(),
+                error
+            ));
+            Err(KernelLoadError::BothSystemSlotsUnavailable)
+        }
+    }
+}
+
+fn recover_from_missing_boot_state(
+    fs: &mut FileSystem,
+) -> Result<KernelImageInfo, KernelLoadError> {
+    let mut selected: Option<(SystemSlot, KernelImageInfo)> = None;
+    for slot in [SystemSlot::A, SystemSlot::B] {
+        match load_system_slot(fs, slot) {
+            Ok(image) => {
+                if selected
+                    .as_ref()
+                    .is_none_or(|(_, current)| image.release_version > current.release_version)
+                {
+                    selected = Some((slot, image));
+                }
+            }
+            Err(error) => log_line(format_args!(
+                "system slot {} rejected during boot-state recovery: {:?}",
+                slot.as_str(),
+                error
+            )),
+        }
+    }
+
+    let Some((slot, mut image)) = selected else {
+        return Err(KernelLoadError::BothSystemSlotsUnavailable);
+    };
+    image.boot_state_generation = 0;
+    image.system_slot = slot.as_u8();
+    image.recovery_fallback = 1;
+    log_line(format_args!(
+        "system boot-state recovery: selected={} version={} source=signed-slot-scan",
+        slot.as_str(),
+        image.release_version
+    ));
+    Ok(image)
+}
+
+fn load_boot_state(fs: &mut FileSystem) -> Result<BootState, KernelLoadError> {
+    let mut selected: Option<BootState> = None;
+    for path in ["\\BOOTSTA0.BIN", "\\BOOTSTA1.BIN"] {
+        let path = CString16::try_from(path).map_err(|_| KernelLoadError::InvalidPath)?;
+        let Ok(bytes) = fs.read(path.as_ref()) else {
+            continue;
+        };
+        let Ok(state) = BootState::decode(&bytes) else {
+            continue;
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|current| state.generation > current.generation)
+        {
+            selected = Some(state);
+        }
+    }
+    selected.ok_or(KernelLoadError::BootStateUnavailable)
+}
+
+fn load_system_slot(
+    fs: &mut FileSystem,
+    slot: SystemSlot,
+) -> Result<KernelImageInfo, KernelLoadError> {
+    let (kernel_path, manifest_path) = match slot {
+        SystemSlot::A => ("\\SYSTEM\\A\\KERNEL.ELF", "\\SYSTEM\\A\\KERNEL.SIG"),
+        SystemSlot::B => ("\\SYSTEM\\B\\KERNEL.ELF", "\\SYSTEM\\B\\KERNEL.SIG"),
+    };
+    let kernel_path = CString16::try_from(kernel_path).map_err(|_| KernelLoadError::InvalidPath)?;
+    let bytes = fs
+        .read(kernel_path.as_ref())
+        .map_err(|_| KernelLoadError::KernelReadFailed)?;
+    let manifest_path =
+        CString16::try_from(manifest_path).map_err(|_| KernelLoadError::InvalidPath)?;
+    let manifest_bytes = fs
+        .read(manifest_path.as_ref())
+        .map_err(|_| KernelLoadError::ManifestReadFailed)?;
+    let manifest =
+        UpdateManifest::decode(&manifest_bytes).map_err(KernelLoadError::ManifestInvalid)?;
+    let verified = verify_kernel_release(&bytes, &manifest)?;
+
+    let mut info = parse_kernel_image(&bytes).ok_or(KernelLoadError::InvalidElf)?;
+    info.release_version = manifest.release_version;
+    info.signature_verified = 1;
+    info.verification_key_id = manifest.key_id;
+    info.kernel_sha256 = manifest.kernel_sha256;
+    if !stage_kernel_segments(&mut info, &bytes) {
+        return Err(KernelLoadError::StagingFailed);
+    }
+    enforce_release_version(manifest.release_version)?;
+    apply_trust_root_update(&manifest, &verified.trust_root)?;
+    Ok(info)
+}
+
+fn verify_kernel_release(
+    kernel: &[u8],
+    manifest: &UpdateManifest,
+) -> Result<VerifiedRelease, KernelLoadError> {
+    if u64::try_from(kernel.len()).ok() != Some(manifest.kernel_size) {
+        return Err(KernelLoadError::KernelSizeMismatch);
+    }
+    let kernel_sha256: [u8; 32] = Sha256::digest(kernel).into();
+    if kernel_sha256 != manifest.kernel_sha256 {
+        return Err(KernelLoadError::KernelHashMismatch);
+    }
+    let trust_root = active_trust_root()?;
+    let verifying_key = VerifyingKey::from_bytes(&trust_root.public_key)
+        .map_err(|_| KernelLoadError::TrustedKeyUnavailable)?;
+    if trust_root.key_id != manifest.key_id {
+        return Err(KernelLoadError::KeyIdMismatch);
+    }
+    let signature = Signature::from_bytes(&manifest.signature);
+    let signing_bytes = manifest.signing_bytes();
+    verifying_key
+        .verify_strict(&signing_bytes[..manifest.signing_len()], &signature)
+        .map_err(|_| KernelLoadError::SignatureInvalid)?;
+    log_line(format_args!(
+        "kernel trust root: source={} activation-version={} signer-key-id={}",
+        trust_root.source.as_str(),
+        trust_root.activation_release_version,
+        HexBytes(&trust_root.key_id)
+    ));
+    Ok(VerifiedRelease { trust_root })
+}
+
+fn active_trust_root() -> Result<TrustRoot, KernelLoadError> {
+    let embedded_public_key =
+        embedded_trusted_public_key().ok_or(KernelLoadError::TrustedKeyUnavailable)?;
+    let embedded = TrustRoot {
+        public_key: embedded_public_key,
+        key_id: key_id_for_public_key(&embedded_public_key),
+        source: TrustRootSource::Embedded,
+        activation_release_version: 0,
     };
 
-    let mut info = match parse_kernel_image(&bytes) {
-        Some(info) => info,
-        None => return KernelImageInfo::EMPTY,
-    };
-    if !stage_kernel_segments(&mut info, &bytes) {
-        return KernelImageInfo::EMPTY;
+    let name = CString16::try_from("CodexOsTrustRoot")
+        .map_err(|_| KernelLoadError::PersistedTrustRootUnavailable)?;
+    let mut buffer = [0_u8; TRUST_ROOT_STATE_BYTES];
+    match runtime::get_variable(name.as_ref(), &CODEXOS_VARIABLE_VENDOR, &mut buffer) {
+        Ok((value, _)) if value.len() == TRUST_ROOT_STATE_BYTES => {
+            let state = TrustRootState::decode(value)
+                .map_err(|_| KernelLoadError::PersistedTrustRootInvalid)?;
+            VerifyingKey::from_bytes(&state.public_key)
+                .map_err(|_| KernelLoadError::PersistedTrustRootInvalid)?;
+            if key_id_for_public_key(&state.public_key) != state.key_id {
+                return Err(KernelLoadError::PersistedTrustRootInvalid);
+            }
+            Ok(TrustRoot {
+                public_key: state.public_key,
+                key_id: state.key_id,
+                source: TrustRootSource::Persisted,
+                activation_release_version: state.activation_release_version,
+            })
+        }
+        Ok(_) => Err(KernelLoadError::PersistedTrustRootInvalid),
+        Err(error) if error.status() == Status::NOT_FOUND => Ok(embedded),
+        Err(_) => Err(KernelLoadError::PersistedTrustRootUnavailable),
     }
-    info
+}
+
+fn apply_trust_root_update(
+    manifest: &UpdateManifest,
+    current: &TrustRoot,
+) -> Result<(), KernelLoadError> {
+    if !manifest.has_next_trust_key() {
+        log_line(format_args!(
+            "trust root update: none source={} signer-key-id={}",
+            current.source.as_str(),
+            HexBytes(&current.key_id)
+        ));
+        return Ok(());
+    }
+
+    let next_public_key = manifest.next_trust_public_key;
+    VerifyingKey::from_bytes(&next_public_key).map_err(|_| KernelLoadError::NextTrustKeyInvalid)?;
+    let next_key_id = key_id_for_public_key(&next_public_key);
+    if next_key_id != manifest.next_trust_key_id {
+        return Err(KernelLoadError::NextTrustKeyIdMismatch);
+    }
+
+    if next_public_key == current.public_key {
+        log_line(format_args!(
+            "trust root update: retained version={} key-id={}",
+            manifest.release_version,
+            HexBytes(&next_key_id)
+        ));
+        return Ok(());
+    }
+
+    let state = TrustRootState {
+        activation_release_version: manifest.release_version,
+        public_key: next_public_key,
+        key_id: next_key_id,
+    };
+    let name = CString16::try_from("CodexOsTrustRoot")
+        .map_err(|_| KernelLoadError::TrustRootUpdateFailed)?;
+    let attributes = VariableAttributes::NON_VOLATILE
+        | VariableAttributes::BOOTSERVICE_ACCESS
+        | VariableAttributes::RUNTIME_ACCESS;
+    runtime::set_variable(
+        name.as_ref(),
+        &CODEXOS_VARIABLE_VENDOR,
+        attributes,
+        &state.encode(),
+    )
+    .map_err(|_| KernelLoadError::TrustRootUpdateFailed)?;
+
+    let mut buffer = [0_u8; TRUST_ROOT_STATE_BYTES];
+    let (value, _) = runtime::get_variable(name.as_ref(), &CODEXOS_VARIABLE_VENDOR, &mut buffer)
+        .map_err(|_| KernelLoadError::TrustRootUpdateFailed)?;
+    if value.len() != TRUST_ROOT_STATE_BYTES || TrustRootState::decode(value).ok() != Some(state) {
+        return Err(KernelLoadError::TrustRootUpdateFailed);
+    }
+
+    log_line(format_args!(
+        "trust root update: activated version={} previous-source={} next-key-id={}",
+        manifest.release_version,
+        current.source.as_str(),
+        HexBytes(&next_key_id)
+    ));
+    Ok(())
+}
+
+fn key_id_for_public_key(public_key: &[u8; PUBLIC_KEY_BYTES]) -> [u8; KEY_ID_BYTES] {
+    let public_hash = Sha256::digest(public_key);
+    let mut key_id = [0_u8; KEY_ID_BYTES];
+    key_id.copy_from_slice(&public_hash[..KEY_ID_BYTES]);
+    key_id
+}
+
+fn embedded_trusted_public_key() -> Option<[u8; PUBLIC_KEY_BYTES]> {
+    let encoded = option_env!("CODEXOS_TRUSTED_PUBLIC_KEY_HEX")?;
+    if encoded.len() != 64 {
+        return None;
+    }
+    let mut key = [0_u8; PUBLIC_KEY_BYTES];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let high = hex_nibble(encoded.as_bytes()[index * 2])?;
+        let low = hex_nibble(encoded.as_bytes()[index * 2 + 1])?;
+        *byte = high << 4 | low;
+    }
+    Some(key)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn enforce_release_version(candidate: u64) -> Result<(), KernelLoadError> {
+    let name = CString16::try_from("CodexOsHighestRelease")
+        .map_err(|_| KernelLoadError::RollbackStateUnavailable)?;
+    let mut buffer = [0_u8; 8];
+    let minimum = match runtime::get_variable(name.as_ref(), &CODEXOS_VARIABLE_VENDOR, &mut buffer)
+    {
+        Ok((value, _)) if value.len() == 8 => {
+            u64::from_le_bytes(value.try_into().unwrap_or([0; 8]))
+        }
+        Ok(_) => return Err(KernelLoadError::RollbackStateUnavailable),
+        Err(error) if error.status() == Status::NOT_FOUND => 0,
+        Err(_) => return Err(KernelLoadError::RollbackStateUnavailable),
+    };
+    if candidate < minimum {
+        return Err(KernelLoadError::RollbackDetected { candidate, minimum });
+    }
+    if candidate > minimum {
+        let attributes = VariableAttributes::NON_VOLATILE
+            | VariableAttributes::BOOTSERVICE_ACCESS
+            | VariableAttributes::RUNTIME_ACCESS;
+        runtime::set_variable(
+            name.as_ref(),
+            &CODEXOS_VARIABLE_VENDOR,
+            attributes,
+            &candidate.to_le_bytes(),
+        )
+        .map_err(|_| KernelLoadError::RollbackStateUnavailable)?;
+    }
+    Ok(())
 }
 
 fn parse_kernel_image(bytes: &[u8]) -> Option<KernelImageInfo> {
     let elf = ElfFile::new(bytes).ok()?;
     let mut info = KernelImageInfo {
         image_size: bytes.len() as u64,
+        release_version: 0,
+        boot_state_generation: 0,
+        system_slot: 0,
+        recovery_fallback: 0,
+        signature_verified: 0,
+        verification_key_id: [0; 16],
+        kernel_sha256: [0; 32],
         entry_point: elf.header.pt2.entry_point(),
         loaded_entry_point: 0,
         load_base: 0,
