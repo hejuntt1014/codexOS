@@ -11,11 +11,14 @@ const PIC_EOI: u8 = 0x20;
 const PIT_CMD: u16 = 0x43;
 const PIT_CH0: u16 = 0x40;
 const PIT_BASE_HZ: u32 = 1_193_182;
-const TIMER_VECTOR: u8 = 32;
+pub const TIMER_VECTOR: u8 = 32;
 const TIMER_HZ: u32 = 100;
-const KERNEL_CODE_SELECTOR: u16 = 0x08;
+pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
 const TSS_SELECTOR: u16 = 0x18;
+pub const USER_DATA_SELECTOR: u16 = 0x2b;
+pub const USER_CODE_SELECTOR: u16 = 0x33;
+pub const USER_SYSCALL_VECTOR: u8 = 0x80;
 const DOUBLE_FAULT_IST: u8 = 1;
 const DOUBLE_FAULT_STACK_BYTES: usize = 64 * 1024;
 
@@ -73,6 +76,11 @@ impl IdtEntry {
         self.ist = ist & 0x07;
         self
     }
+
+    fn with_dpl(mut self, dpl: u8) -> Self {
+        self.type_attr = (self.type_attr & !0x60) | ((dpl & 0x03) << 5);
+        self
+    }
 }
 
 #[repr(C, packed)]
@@ -115,7 +123,7 @@ struct EmergencyStack {
     _storage: [u8; DOUBLE_FAULT_STACK_BYTES],
 }
 
-struct GdtCell(UnsafeCell<[u64; 5]>);
+struct GdtCell(UnsafeCell<[u64; 7]>);
 struct TssCell(UnsafeCell<TaskStateSegment>);
 struct StackCell(UnsafeCell<EmergencyStack>);
 
@@ -124,35 +132,42 @@ unsafe impl Sync for TssCell {}
 unsafe impl Sync for StackCell {}
 
 #[repr(C)]
-struct TrapFrame {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
-    vector: u64,
-    error_code: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
+#[derive(Clone, Copy, Debug)]
+pub struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub vector: u64,
+    pub error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
 }
+
+pub type UserTrapHandler = fn(&mut TrapFrame, u64) -> bool;
 
 struct IdtCell(UnsafeCell<[IdtEntry; IDT_ENTRIES]>);
 
 unsafe impl Sync for IdtCell {}
 
+struct UserTrapHandlerCell(UnsafeCell<Option<UserTrapHandler>>);
+
+unsafe impl Sync for UserTrapHandlerCell {}
+
 static IDT: IdtCell = IdtCell(UnsafeCell::new([IdtEntry::MISSING; IDT_ENTRIES]));
-static GDT: GdtCell = GdtCell(UnsafeCell::new([0; 5]));
+static GDT: GdtCell = GdtCell(UnsafeCell::new([0; 7]));
 static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::EMPTY));
 static DOUBLE_FAULT_STACK: StackCell = StackCell(UnsafeCell::new(EmergencyStack {
     _storage: [0; DOUBLE_FAULT_STACK_BYTES],
@@ -163,10 +178,12 @@ static HARDWARE_INTERRUPTS_ENABLED: AtomicBool = AtomicBool::new(false);
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static TIMER_SEEN: AtomicBool = AtomicBool::new(false);
 static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
+static USER_TRAP_HANDLER: UserTrapHandlerCell = UserTrapHandlerCell(UnsafeCell::new(None));
 
 unsafe extern "C" {
     fn interrupt_default_stub();
     fn interrupt_timer_stub();
+    fn interrupt_user_syscall_stub();
     fn interrupt_exception_0();
     fn interrupt_exception_1();
     fn interrupt_exception_2();
@@ -246,6 +263,8 @@ pub fn init_idt() -> bool {
         idt[30] = IdtEntry::new(interrupt_exception_30, selector);
         idt[31] = IdtEntry::new(interrupt_exception_31, selector);
         idt[TIMER_VECTOR as usize] = IdtEntry::new(interrupt_timer_stub, selector);
+        idt[USER_SYSCALL_VECTOR as usize] =
+            IdtEntry::new(interrupt_user_syscall_stub, selector).with_dpl(3);
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
@@ -277,7 +296,7 @@ pub fn activate_hardware() -> bool {
 pub fn wait_for_interrupt() {
     if HARDWARE_INTERRUPTS_ENABLED.load(Ordering::Acquire) {
         unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti", "hlt", options(nomem, nostack));
         }
     } else {
         core::hint::spin_loop();
@@ -293,6 +312,60 @@ pub fn verify_exception_path() -> bool {
         core::arch::asm!("int3", options(nomem, nostack));
     }
     BREAKPOINT_HITS.load(Ordering::Acquire) == before.wrapping_add(1)
+}
+
+pub fn register_user_trap_handler(handler: UserTrapHandler) {
+    unsafe {
+        *USER_TRAP_HANDLER.0.get() = Some(handler);
+    }
+}
+
+pub fn set_privilege_stack(stack_top: u64) -> bool {
+    if !GDT_LOADED.load(Ordering::Acquire) || stack_top == 0 {
+        return false;
+    }
+    unsafe {
+        core::ptr::addr_of_mut!((*TSS.0.get()).privilege_stacks)
+            .cast::<u64>()
+            .write_unaligned(stack_top);
+    }
+    true
+}
+
+pub fn user_stack(frame: &TrapFrame) -> Option<(u64, u64)> {
+    if frame.cs & 3 != 3 {
+        return None;
+    }
+    let stack_fields = (frame as *const TrapFrame).cast::<u8>();
+    unsafe {
+        let user_rsp = stack_fields
+            .add(core::mem::size_of::<TrapFrame>())
+            .cast::<u64>()
+            .read_unaligned();
+        let user_ss = stack_fields
+            .add(core::mem::size_of::<TrapFrame>() + core::mem::size_of::<u64>())
+            .cast::<u64>()
+            .read_unaligned();
+        Some((user_rsp, user_ss))
+    }
+}
+
+pub fn set_user_stack(frame: &mut TrapFrame, user_rsp: u64, user_ss: u64) -> bool {
+    if frame.cs & 3 != 3 {
+        return false;
+    }
+    let stack_fields = (frame as *mut TrapFrame).cast::<u8>();
+    unsafe {
+        stack_fields
+            .add(core::mem::size_of::<TrapFrame>())
+            .cast::<u64>()
+            .write_unaligned(user_rsp);
+        stack_fields
+            .add(core::mem::size_of::<TrapFrame>() + core::mem::size_of::<u64>())
+            .cast::<u64>()
+            .write_unaligned(user_ss);
+    }
+    true
 }
 
 pub fn halt() -> ! {
@@ -341,9 +414,11 @@ unsafe fn init_gdt_tss() {
     gdt[2] = 0x00cf_9200_0000_ffff;
     gdt[3] = tss_low;
     gdt[4] = tss_high;
+    gdt[5] = 0x00cf_f200_0000_ffff;
+    gdt[6] = 0x00af_fa00_0000_ffff;
 
     let gdtr = Gdtr {
-        limit: (core::mem::size_of::<[u64; 5]>() - 1) as u16,
+        limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
         base: gdt.as_ptr() as u64,
     };
     unsafe {
@@ -384,22 +459,24 @@ fn tss_descriptor(base: u64) -> (u64, u64) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn interrupt_dispatch(frame: &TrapFrame) {
-    match frame.vector as u8 {
+extern "C" fn interrupt_dispatch(frame: &mut TrapFrame) -> u64 {
+    let vector = frame.vector as u8;
+    let mut user_handled = false;
+    if frame.cs & 3 == 3 {
+        let fault_address = if vector == 14 { read_cr2() } else { 0 };
+        let handler = unsafe { *USER_TRAP_HANDLER.0.get() };
+        user_handled = handler.is_some_and(|handler| handler(frame, fault_address));
+    }
+    if vector == TIMER_VECTOR {
+        record_timer_tick();
+        return u64::from(user_handled && frame.cs & 3 == 0);
+    }
+    if user_handled {
+        return u64::from(frame.cs & 3 == 0);
+    }
+    match vector {
         TIMER_VECTOR => {
-            let ticks = TIMER_TICKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            if !TIMER_SEEN.swap(true, Ordering::SeqCst) {
-                crate::serial::print(format_args!(
-                    "interrupts: timer tick online hz={} vector={}\r\n",
-                    TIMER_HZ, TIMER_VECTOR
-                ));
-            }
-            if ticks.is_multiple_of(TIMER_HZ as u64) {
-                core::sync::atomic::compiler_fence(Ordering::SeqCst);
-            }
-            unsafe {
-                send_eoi(TIMER_VECTOR);
-            }
+            unreachable!()
         }
         3 => {
             BREAKPOINT_HITS.fetch_add(1, Ordering::Release);
@@ -415,6 +492,23 @@ extern "C" fn interrupt_dispatch(frame: &TrapFrame) {
             exception_has_error_code(frame.vector as u8).then_some(frame.error_code),
         ),
         _ => fatal_exception("unexpected interrupt", frame, Some(frame.error_code)),
+    }
+    0
+}
+
+fn record_timer_tick() {
+    let ticks = TIMER_TICKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if !TIMER_SEEN.swap(true, Ordering::SeqCst) {
+        crate::serial::print(format_args!(
+            "interrupts: timer tick online hz={} vector={}\r\n",
+            TIMER_HZ, TIMER_VECTOR
+        ));
+    }
+    if ticks.is_multiple_of(TIMER_HZ as u64) {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+    unsafe {
+        send_eoi(TIMER_VECTOR);
     }
 }
 
@@ -659,6 +753,12 @@ core::arch::global_asm!(
         sub rsp, 32
         cld
         call interrupt_dispatch
+        test rax, rax
+        jz 9f
+        mov rax, qword ptr [r12 + {trap_rip_offset}]
+        lea rsp, [r12 + {trap_frame_size}]
+        jmp rax
+    9:
         mov rsp, r12
     .endm
 
@@ -710,6 +810,7 @@ core::arch::global_asm!(
 
     ISR_NOERR interrupt_default_stub, 255
     ISR_NOERR interrupt_timer_stub, 32
+    ISR_NOERR interrupt_user_syscall_stub, 128
 
     ISR_EXCEPTION_NOERR 0
     ISR_EXCEPTION_NOERR 1
@@ -744,7 +845,9 @@ core::arch::global_asm!(
     ISR_EXCEPTION_ERR 30
     ISR_EXCEPTION_NOERR 31
 
-    "#
+    "#,
+    trap_frame_size = const core::mem::size_of::<TrapFrame>(),
+    trap_rip_offset = const core::mem::offset_of!(TrapFrame, rip),
 );
 
 #[cfg(test)]
@@ -775,5 +878,63 @@ mod tests {
         assert_eq!(decoded_base, base);
         assert_eq!((low >> 40) & 0xff, 0x89);
         assert_eq!(low & 0xffff, 103);
+    }
+
+    #[test]
+    fn exposes_only_the_syscall_gate_to_ring_three() {
+        let gate = IdtEntry::from_addr(0x1234, KERNEL_CODE_SELECTOR).with_dpl(3);
+        assert_eq!((gate.type_attr >> 5) & 3, 3);
+        let selector = gate.selector;
+        assert_eq!(selector, KERNEL_CODE_SELECTOR);
+    }
+
+    #[test]
+    fn trap_frame_prefix_ends_before_the_hardware_user_stack_fields() {
+        assert_eq!(core::mem::size_of::<TrapFrame>(), 160);
+    }
+
+    #[test]
+    fn reads_and_rewrites_hardware_user_stack_fields() {
+        #[repr(C)]
+        struct CompleteUserFrame {
+            frame: TrapFrame,
+            user_rsp: u64,
+            user_ss: u64,
+        }
+
+        let mut complete = CompleteUserFrame {
+            frame: TrapFrame {
+                r15: 0,
+                r14: 0,
+                r13: 0,
+                r12: 0,
+                r11: 0,
+                r10: 0,
+                r9: 0,
+                r8: 0,
+                rbp: 0,
+                rdi: 0,
+                rsi: 0,
+                rdx: 0,
+                rcx: 0,
+                rbx: 0,
+                rax: 0,
+                vector: u64::from(TIMER_VECTOR),
+                error_code: 0,
+                rip: 0x2000,
+                cs: u64::from(USER_CODE_SELECTOR),
+                rflags: 0x202,
+            },
+            user_rsp: 0x8000,
+            user_ss: u64::from(USER_DATA_SELECTOR),
+        };
+
+        assert_eq!(
+            user_stack(&complete.frame),
+            Some((0x8000, u64::from(USER_DATA_SELECTOR)))
+        );
+        assert!(set_user_stack(&mut complete.frame, 0x9000, 0x2b));
+        assert_eq!(complete.user_rsp, 0x9000);
+        assert_eq!(complete.user_ss, 0x2b);
     }
 }

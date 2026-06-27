@@ -113,6 +113,7 @@ pub enum ReservedMemoryKind {
     RuntimeHeap = 5,
     KernelHeap = 6,
     DescriptorTables = 7,
+    PageTables = 8,
     Unknown = u32::MAX,
 }
 
@@ -127,6 +128,7 @@ impl ReservedMemoryKind {
             Self::RuntimeHeap => "runtime-heap",
             Self::KernelHeap => "kernel-heap",
             Self::DescriptorTables => "descriptor-tables",
+            Self::PageTables => "page-tables",
             Self::Unknown => "unknown",
         }
     }
@@ -220,6 +222,13 @@ impl KernelImageSegment {
 #[repr(C)]
 pub struct KernelImageInfo {
     pub image_size: u64,
+    pub release_version: u64,
+    pub boot_state_generation: u64,
+    pub system_slot: u8,
+    pub recovery_fallback: u8,
+    pub signature_verified: u8,
+    pub verification_key_id: [u8; 16],
+    pub kernel_sha256: [u8; 32],
     pub entry_point: u64,
     pub loaded_entry_point: u64,
     pub load_base: u64,
@@ -235,6 +244,13 @@ pub struct KernelImageInfo {
 impl KernelImageInfo {
     pub const EMPTY: Self = Self {
         image_size: 0,
+        release_version: 0,
+        boot_state_generation: 0,
+        system_slot: 0,
+        recovery_fallback: 0,
+        signature_verified: 0,
+        verification_key_id: [0; 16],
+        kernel_sha256: [0; 32],
         entry_point: 0,
         loaded_entry_point: 0,
         load_base: 0,
@@ -302,6 +318,29 @@ impl BootInfo {
             .fold(0_u64, |sum, range| sum.saturating_add(range.length))
     }
 
+    pub fn reserve_memory(&mut self, start: u64, length: u64, kind: ReservedMemoryKind) -> bool {
+        if length == 0 {
+            return false;
+        }
+        if let Some(existing) = self.reserved_memory[..self.reserved_memory_count]
+            .iter_mut()
+            .find(|range| range.kind == kind && range.end() == start)
+        {
+            existing.length = existing.length.saturating_add(length);
+            return true;
+        }
+        if self.reserved_memory_count >= MAX_RESERVED_MEMORY_RANGES {
+            return false;
+        }
+        self.reserved_memory[self.reserved_memory_count] = ReservedMemoryRange {
+            start,
+            length,
+            kind,
+        };
+        self.reserved_memory_count += 1;
+        true
+    }
+
     pub fn usable_memory_bytes(&self) -> u64 {
         self.memory_regions().iter().fold(0_u64, |sum, region| {
             if self.firmware_mode.region_is_currently_usable(region.kind) {
@@ -310,5 +349,55 @@ impl BootInfo {
                 sum
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_boot_info() -> BootInfo {
+        BootInfo {
+            framebuffer: FrameBufferInfo {
+                base: core::ptr::null_mut(),
+                size: 0,
+                width: 0,
+                height: 0,
+                stride: 0,
+                bytes_per_pixel: 4,
+                pixel_format: PixelFormat::Unknown,
+            },
+            firmware_mode: FirmwareMode::PostExitBootServices,
+            runtime_hhdm_base: 0,
+            memory_region_count: 0,
+            memory_region_total: 0,
+            memory_regions: [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS],
+            reserved_memory_count: 0,
+            reserved_memory: [ReservedMemoryRange::EMPTY; MAX_RESERVED_MEMORY_RANGES],
+            kernel_image: KernelImageInfo::EMPTY,
+        }
+    }
+
+    #[test]
+    fn coalesces_adjacent_reserved_ranges_of_the_same_kind() {
+        let mut info = empty_boot_info();
+        assert!(info.reserve_memory(0x1000, 0x2000, ReservedMemoryKind::PageTables));
+        assert!(info.reserve_memory(0x3000, 0x1000, ReservedMemoryKind::PageTables));
+        assert_eq!(info.reserved_memory_count, 1);
+        assert_eq!(info.reserved_memory[0].start, 0x1000);
+        assert_eq!(info.reserved_memory[0].length, 0x3000);
+    }
+
+    #[test]
+    fn rejects_reserved_ranges_beyond_the_abi_capacity() {
+        let mut info = empty_boot_info();
+        for index in 0..MAX_RESERVED_MEMORY_RANGES {
+            assert!(info.reserve_memory(
+                0x1000 + index as u64 * 0x2000,
+                0x1000,
+                ReservedMemoryKind::Unknown,
+            ));
+        }
+        assert!(!info.reserve_memory(0x10_0000, 0x1000, ReservedMemoryKind::PageTables));
     }
 }

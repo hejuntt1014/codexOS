@@ -16,7 +16,12 @@ const PAGE_TABLE_ENTRIES: usize = 512;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
+const ENTRY_USER: u64 = 1 << 2;
 const ENTRY_NO_EXECUTE: u64 = 1 << 63;
+pub const USER_CODE_BASE: u64 = 0x0000_2000_0000_0000;
+pub const USER_STACK_TOP: u64 = USER_CODE_BASE + 0x20_0000;
+const USER_PROGRAM_LIMIT: u64 = USER_STACK_TOP - PAGE_SIZE;
+const MAX_USER_OWNED_PAGES: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 pub struct VmStats {
@@ -36,6 +41,75 @@ pub struct Mapping {
     pub page_count: u64,
     pub writable: bool,
     pub executable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserAddressSpace {
+    pub kernel_root_phys: u64,
+    pub root_phys: u64,
+    pub code_phys: u64,
+    pub stack_phys: u64,
+    pub entry: u64,
+    pub stack_top: u64,
+    pub code_bytes: usize,
+    pub kernel_mapping_supervisor_only: bool,
+    pub code_user_read_execute: bool,
+    pub stack_user_read_write: bool,
+    owned_pages: [u64; MAX_USER_OWNED_PAGES],
+    owned_page_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserSegment<'a> {
+    pub virtual_address: u64,
+    pub data: &'a [u8],
+    pub memory_size: u64,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UserPageOwnership {
+    pages: [u64; MAX_USER_OWNED_PAGES],
+    count: usize,
+}
+
+impl UserPageOwnership {
+    const fn new() -> Self {
+        Self {
+            pages: [0; MAX_USER_OWNED_PAGES],
+            count: 0,
+        }
+    }
+
+    fn record(&mut self, phys: u64) -> Result<(), VmError> {
+        if self.count >= self.pages.len() {
+            return Err(VmError::UserPageTrackingCapacity);
+        }
+        self.pages[self.count] = phys;
+        self.count += 1;
+        Ok(())
+    }
+
+    fn reclaim(self) -> Result<(), VmError> {
+        let mut failed = false;
+        for phys in self.pages[..self.count].iter().rev().copied() {
+            match physical_page_mut(phys) {
+                Ok(page) => unsafe {
+                    core::ptr::write_bytes(page, 0, PAGE_SIZE as usize);
+                },
+                Err(_) => failed = true,
+            }
+            if !memory::deallocate_page(phys) {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(VmError::PageReclamationFailed)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -484,6 +558,28 @@ impl VirtualMemoryManager {
             }
         }
 
+        for region in boot_info.memory_regions() {
+            if !boot_info
+                .firmware_mode
+                .region_is_currently_usable(region.kind)
+                || region.page_count == 0
+            {
+                continue;
+            }
+            let window_virt = higher_half_phys(region.start).ok_or(VmError::AddressOverflow)?;
+            let region_end = region
+                .start
+                .checked_add(region.size_bytes())
+                .ok_or(VmError::AddressOverflow)?;
+            let pages = self
+                .map_window_range(window_virt, region.start, region_end, true, false)
+                .map_err(|err| remap_conflict(err, VmError::BootWindowConflict))?;
+            if pages != 0 {
+                report.higher_half_ranges += 1;
+                report.higher_half_pages = report.higher_half_pages.saturating_add(pages);
+            }
+        }
+
         for mapping in kernel_page_mappings(&boot_info.kernel_image)? {
             let pages = self
                 .map_fixed_range(
@@ -819,6 +915,17 @@ pub enum VmError {
     ReservedWindowConflict,
     KernelImageConflict,
     KernelWritableExecutable,
+    UserProgramEmpty,
+    UserProgramTooLarge,
+    UserRegionConflict,
+    UserMappingConflict,
+    UserEntryInvalid,
+    UserWritableExecutable,
+    UserPageTrackingCapacity,
+    ActiveAddressSpace,
+    PageReclamationFailed,
+    DirectMapUnavailable,
+    ReservedRangeCapacity,
     AddressOverflow,
     AlreadyMapped,
     OutOfPhysicalPages,
@@ -913,6 +1020,223 @@ pub fn physical_to_high_half(phys: u64) -> Option<u64> {
     higher_half_phys(phys)
 }
 
+pub fn create_user_address_space(code: &[u8]) -> Result<UserAddressSpace, VmError> {
+    if code.is_empty() {
+        return Err(VmError::UserProgramEmpty);
+    }
+    if code.len() > PAGE_SIZE as usize {
+        return Err(VmError::UserProgramTooLarge);
+    }
+    create_user_address_space_from_segments(
+        USER_CODE_BASE,
+        &[UserSegment {
+            virtual_address: USER_CODE_BASE,
+            data: code,
+            memory_size: code.len() as u64,
+            writable: false,
+            executable: true,
+        }],
+    )
+}
+
+pub fn create_user_address_space_from_segments(
+    entry: u64,
+    segments: &[UserSegment<'_>],
+) -> Result<UserAddressSpace, VmError> {
+    validate_user_program(entry, segments)?;
+    let kernel_root_phys = read_cr3();
+    let mut ownership = UserPageOwnership::new();
+    let result = (|| {
+        let root_phys = allocate_owned_zeroed_page(&mut ownership)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                physical_page_ptr(kernel_root_phys)?,
+                physical_page_mut(root_phys)?,
+                PAGE_SIZE as usize,
+            );
+        }
+
+        let user_l4 = split_indices(USER_CODE_BASE)[0] as usize;
+        let root = physical_table_mut(root_phys)?;
+        if unsafe { *root.add(user_l4) } & ENTRY_PRESENT != 0 {
+            return Err(VmError::UserRegionConflict);
+        }
+
+        let mut code_phys = 0_u64;
+        let mut loaded_bytes = 0_usize;
+        for segment in segments {
+            let segment_end = segment
+                .virtual_address
+                .checked_add(segment.memory_size)
+                .ok_or(VmError::AddressOverflow)?;
+            let page_start = align_down(segment.virtual_address);
+            let page_end = align_up_checked(segment_end)?;
+            let data_end = segment
+                .virtual_address
+                .checked_add(segment.data.len() as u64)
+                .ok_or(VmError::AddressOverflow)?;
+            let mut page_virt = page_start;
+            while page_virt < page_end {
+                let page_phys = allocate_owned_zeroed_page(&mut ownership)?;
+                let copy_start = page_virt.max(segment.virtual_address);
+                let copy_end = page_virt.saturating_add(PAGE_SIZE).min(data_end);
+                if copy_start < copy_end {
+                    let source_offset = usize::try_from(copy_start - segment.virtual_address)
+                        .map_err(|_| VmError::AddressOverflow)?;
+                    let destination_offset = usize::try_from(copy_start - page_virt)
+                        .map_err(|_| VmError::AddressOverflow)?;
+                    let copy_len = usize::try_from(copy_end - copy_start)
+                        .map_err(|_| VmError::AddressOverflow)?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            segment.data.as_ptr().add(source_offset),
+                            physical_page_mut(page_phys)?.add(destination_offset),
+                            copy_len,
+                        );
+                    }
+                }
+                raw_map_user_page(
+                    root_phys,
+                    page_virt,
+                    page_phys,
+                    segment.writable,
+                    segment.executable,
+                    &mut ownership,
+                )?;
+                if segment.executable && code_phys == 0 {
+                    code_phys = page_phys;
+                }
+                page_virt = page_virt
+                    .checked_add(PAGE_SIZE)
+                    .ok_or(VmError::AddressOverflow)?;
+            }
+            loaded_bytes = loaded_bytes
+                .checked_add(segment.data.len())
+                .ok_or(VmError::AddressOverflow)?;
+        }
+
+        let stack_phys = allocate_owned_zeroed_page(&mut ownership)?;
+        raw_map_user_page(
+            root_phys,
+            USER_STACK_TOP - PAGE_SIZE,
+            stack_phys,
+            true,
+            false,
+            &mut ownership,
+        )?;
+
+        let code_entry = raw_leaf_entry(root_phys, entry)?;
+        let stack_entry = raw_leaf_entry(root_phys, USER_STACK_TOP - PAGE_SIZE)?;
+        let kernel_l4_entry =
+            unsafe { *physical_table_mut(root_phys)?.add(split_indices(0x20_0000)[0] as usize) };
+        Ok(UserAddressSpace {
+            kernel_root_phys,
+            root_phys,
+            code_phys,
+            stack_phys,
+            entry,
+            stack_top: USER_STACK_TOP - 16,
+            code_bytes: loaded_bytes,
+            kernel_mapping_supervisor_only: kernel_l4_entry & ENTRY_USER == 0,
+            code_user_read_execute: code_entry & (ENTRY_PRESENT | ENTRY_USER)
+                == (ENTRY_PRESENT | ENTRY_USER)
+                && code_entry & ENTRY_WRITABLE == 0
+                && code_entry & ENTRY_NO_EXECUTE == 0,
+            stack_user_read_write: stack_entry & (ENTRY_PRESENT | ENTRY_USER | ENTRY_WRITABLE)
+                == (ENTRY_PRESENT | ENTRY_USER | ENTRY_WRITABLE)
+                && stack_entry & ENTRY_NO_EXECUTE != 0,
+            owned_pages: ownership.pages,
+            owned_page_count: ownership.count,
+        })
+    })();
+    if result.is_err() {
+        ownership.reclaim()?;
+    }
+    result
+}
+
+pub fn destroy_user_address_space(space: UserAddressSpace) -> Result<(), VmError> {
+    if current_root() == space.root_phys {
+        return Err(VmError::ActiveAddressSpace);
+    }
+    UserPageOwnership {
+        pages: space.owned_pages,
+        count: space.owned_page_count,
+    }
+    .reclaim()
+}
+
+pub fn switch_root(root_table_phys: u64) -> Result<(), VmError> {
+    if !root_table_phys.is_multiple_of(PAGE_SIZE) {
+        return Err(VmError::UnalignedPhysicalAddress);
+    }
+    load_cr3(root_table_phys);
+    Ok(())
+}
+
+pub fn current_root() -> u64 {
+    read_cr3()
+}
+
+fn validate_user_program(entry: u64, segments: &[UserSegment<'_>]) -> Result<(), VmError> {
+    if segments.is_empty() {
+        return Err(VmError::UserProgramEmpty);
+    }
+    let mut entry_executable = false;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.memory_size == 0 {
+            return Err(VmError::UserProgramEmpty);
+        }
+        if segment.writable && segment.executable {
+            return Err(VmError::UserWritableExecutable);
+        }
+        let data_len = segment.data.len() as u64;
+        if data_len > segment.memory_size {
+            return Err(VmError::UserProgramTooLarge);
+        }
+        let segment_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or(VmError::AddressOverflow)?;
+        if segment.virtual_address < USER_CODE_BASE || segment_end > USER_PROGRAM_LIMIT {
+            return Err(VmError::UserRegionConflict);
+        }
+        let page_start = align_down(segment.virtual_address);
+        let page_end = align_up_checked(segment_end)?;
+        if page_start < USER_CODE_BASE || page_end > USER_PROGRAM_LIMIT {
+            return Err(VmError::UserRegionConflict);
+        }
+        for previous in &segments[..index] {
+            let previous_end = previous
+                .virtual_address
+                .checked_add(previous.memory_size)
+                .ok_or(VmError::AddressOverflow)?;
+            if ranges_overlap(
+                page_start,
+                page_end,
+                align_down(previous.virtual_address),
+                align_up_checked(previous_end)?,
+            ) {
+                return Err(VmError::UserMappingConflict);
+            }
+        }
+        if segment.executable
+            && entry >= segment.virtual_address
+            && entry
+                < segment
+                    .virtual_address
+                    .checked_add(data_len)
+                    .ok_or(VmError::AddressOverflow)?
+        {
+            entry_executable = true;
+        }
+    }
+    if !entry_executable {
+        return Err(VmError::UserEntryInvalid);
+    }
+    Ok(())
+}
+
 fn next_demo_base() -> u64 {
     let stats = stats();
     DEMO_VIRT_BASE + stats.mapped_pages.saturating_mul(PAGE_SIZE)
@@ -941,6 +1265,10 @@ fn make_table_entry(phys: u64) -> u64 {
     (phys & ADDRESS_MASK) | ENTRY_PRESENT | ENTRY_WRITABLE
 }
 
+fn make_user_table_entry(phys: u64) -> u64 {
+    (phys & ADDRESS_MASK) | ENTRY_PRESENT | ENTRY_WRITABLE | ENTRY_USER
+}
+
 fn make_leaf_entry(phys: u64, writable: bool, executable: bool) -> u64 {
     let mut entry = (phys & ADDRESS_MASK) | ENTRY_PRESENT;
     if writable {
@@ -960,12 +1288,112 @@ fn entry_address(entry: u64) -> u64 {
     entry & ADDRESS_MASK
 }
 
+fn allocate_zeroed_page() -> Result<u64, VmError> {
+    let phys = memory::allocate_page().ok_or(VmError::OutOfPhysicalPages)?;
+    unsafe {
+        core::ptr::write_bytes(physical_page_mut(phys)?, 0, PAGE_SIZE as usize);
+    }
+    Ok(phys)
+}
+
+fn allocate_owned_zeroed_page(ownership: &mut UserPageOwnership) -> Result<u64, VmError> {
+    let phys = allocate_zeroed_page()?;
+    if let Err(error) = ownership.record(phys) {
+        if !memory::deallocate_page(phys) {
+            return Err(VmError::PageReclamationFailed);
+        }
+        return Err(error);
+    }
+    Ok(phys)
+}
+
+fn physical_page_ptr(phys: u64) -> Result<*const u8, VmError> {
+    higher_half_phys(phys)
+        .map(|virt| virt as *const u8)
+        .ok_or(VmError::DirectMapUnavailable)
+}
+
+fn physical_page_mut(phys: u64) -> Result<*mut u8, VmError> {
+    higher_half_phys(phys)
+        .map(|virt| virt as *mut u8)
+        .ok_or(VmError::DirectMapUnavailable)
+}
+
+fn physical_table_mut(phys: u64) -> Result<*mut u64, VmError> {
+    physical_page_mut(phys).map(|page| page.cast::<u64>())
+}
+
+fn raw_map_user_page(
+    root_phys: u64,
+    virt: u64,
+    phys: u64,
+    writable: bool,
+    executable: bool,
+    ownership: &mut UserPageOwnership,
+) -> Result<(), VmError> {
+    let indices = split_indices(virt);
+    let mut table_phys = root_phys;
+    for index in &indices[..3] {
+        let table = physical_table_mut(table_phys)?;
+        let slot = unsafe { table.add(*index as usize) };
+        let mut entry = unsafe { *slot };
+        if entry & ENTRY_PRESENT == 0 {
+            let child = allocate_owned_zeroed_page(ownership)?;
+            entry = make_user_table_entry(child);
+            unsafe {
+                *slot = entry;
+            }
+        } else if entry & ENTRY_USER == 0 {
+            return Err(VmError::UserRegionConflict);
+        }
+        table_phys = entry_address(entry);
+    }
+
+    let leaf_table = physical_table_mut(table_phys)?;
+    let leaf = unsafe { leaf_table.add(indices[3] as usize) };
+    if unsafe { *leaf } & ENTRY_PRESENT != 0 {
+        return Err(VmError::UserMappingConflict);
+    }
+    let mut entry = make_leaf_entry(phys, writable, executable) | ENTRY_USER;
+    if !executable {
+        entry |= ENTRY_NO_EXECUTE;
+    }
+    unsafe {
+        *leaf = entry;
+    }
+    Ok(())
+}
+
+fn raw_leaf_entry(root_phys: u64, virt: u64) -> Result<u64, VmError> {
+    let indices = split_indices(virt);
+    let mut table_phys = root_phys;
+    for index in &indices[..3] {
+        let entry = unsafe { *physical_table_mut(table_phys)?.add(*index as usize) };
+        if entry & (ENTRY_PRESENT | ENTRY_USER) != (ENTRY_PRESENT | ENTRY_USER) {
+            return Err(VmError::UserMappingConflict);
+        }
+        table_phys = entry_address(entry);
+    }
+    let leaf = unsafe { *physical_table_mut(table_phys)?.add(indices[3] as usize) };
+    if leaf & ENTRY_PRESENT == 0 {
+        return Err(VmError::UserMappingConflict);
+    }
+    Ok(leaf)
+}
+
 fn align_down(value: u64) -> u64 {
     value & !(PAGE_SIZE - 1)
 }
 
 fn align_up(value: u64) -> u64 {
     value.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+fn align_up_checked(value: u64) -> Result<u64, VmError> {
+    value
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value & !(PAGE_SIZE - 1))
+        .ok_or(VmError::AddressOverflow)
 }
 
 fn higher_half_phys(phys: u64) -> Option<u64> {
@@ -1256,5 +1684,65 @@ mod tests {
             kernel_page_mappings(&image),
             Err(VmError::KernelWritableExecutable)
         ));
+    }
+
+    #[test]
+    fn validates_user_program_segment_permissions_and_entry() {
+        let code = [0x90_u8, 0xcc];
+        let data = [0x2a_u8];
+        let segments = [
+            UserSegment {
+                virtual_address: USER_CODE_BASE,
+                data: &code,
+                memory_size: PAGE_SIZE,
+                writable: false,
+                executable: true,
+            },
+            UserSegment {
+                virtual_address: USER_CODE_BASE + PAGE_SIZE,
+                data: &data,
+                memory_size: PAGE_SIZE,
+                writable: true,
+                executable: false,
+            },
+        ];
+        assert_eq!(validate_user_program(USER_CODE_BASE, &segments), Ok(()));
+    }
+
+    #[test]
+    fn rejects_user_program_wx_or_overlapping_pages() {
+        let bytes = [0x90_u8];
+        let wx = [UserSegment {
+            virtual_address: USER_CODE_BASE,
+            data: &bytes,
+            memory_size: PAGE_SIZE,
+            writable: true,
+            executable: true,
+        }];
+        assert_eq!(
+            validate_user_program(USER_CODE_BASE, &wx),
+            Err(VmError::UserWritableExecutable)
+        );
+
+        let overlapping = [
+            UserSegment {
+                virtual_address: USER_CODE_BASE,
+                data: &bytes,
+                memory_size: PAGE_SIZE,
+                writable: false,
+                executable: true,
+            },
+            UserSegment {
+                virtual_address: USER_CODE_BASE + 128,
+                data: &bytes,
+                memory_size: PAGE_SIZE,
+                writable: true,
+                executable: false,
+            },
+        ];
+        assert_eq!(
+            validate_user_program(USER_CODE_BASE, &overlapping),
+            Err(VmError::UserMappingConflict)
+        );
     }
 }
