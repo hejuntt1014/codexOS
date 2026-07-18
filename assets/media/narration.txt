@@ -1,0 +1,9 @@
+This is codexOS — a bootable Rust GUI operating system for QEMU and UEFI.
+
+It chainloads a resident kernel, then opens a live desktop with a terminal and system inspector.
+
+From the shell, you can inspect boot state, memory, and virtual memory — after firmware services have exited.
+
+Under the hood you get Ring 3 isolation, CodexFS persistent storage, virtio networking with DHCP and HTTP, and signed A/B kernel updates.
+
+Built end-to-end with OpenAI Codex, starting on GPT-5.4 and now running on the latest GPT-5.6.

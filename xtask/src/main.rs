@@ -20,6 +20,7 @@ const IMAGE_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const DATA_IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const DEVELOPMENT_SIGNING_KEY: &str = "codexos-development-signing-key.bin";
 const NETWORK_LISTENER_GUEST_PORT: u16 = 8080;
+const NETWORK_LISTENER_CONCURRENCY: usize = 4;
 const DISK_SECTOR_BYTES: u64 = 512;
 const GPT_ENTRY_COUNT: u32 = 128;
 const GPT_ENTRY_BYTES: u32 = 128;
@@ -2092,17 +2093,27 @@ fn smoke_network_listener() -> Result<()> {
             "standalone keyboard polling active",
             Duration::from_secs(30),
         )?;
-        let response = probe_kernel_http_listener(host_port)?;
-        if !response.starts_with("HTTP/1.1 200 OK") || !response.contains("codexOS listener online")
-        {
-            bail!("kernel listener returned an unexpected HTTP response:\n{response}");
+        let responses =
+            probe_kernel_http_listener_concurrent(host_port, NETWORK_LISTENER_CONCURRENCY)?;
+        for response in &responses {
+            if !response.starts_with("HTTP/1.1 200 OK")
+                || !response.contains("codexOS listener online")
+            {
+                bail!("kernel listener returned an unexpected HTTP response:\n{response}");
+            }
         }
         let served = wait_for_serial_log(
             &serial_log,
-            "tcp listener served: port=8080",
+            &format!("connections={NETWORK_LISTENER_CONCURRENCY}"),
             Duration::from_secs(10),
         )?;
-        validate_network_listener_log(&served)?;
+        validate_network_listener_log(&served, NETWORK_LISTENER_CONCURRENCY)?;
+        let closed = wait_for_serial_log(
+            &serial_log,
+            &format!("total={NETWORK_LISTENER_CONCURRENCY}"),
+            Duration::from_secs(10),
+        )?;
+        validate_network_listener_closure_log(&closed, NETWORK_LISTENER_CONCURRENCY)?;
         Ok(())
     })();
     let _ = child.kill();
@@ -2110,8 +2121,8 @@ fn smoke_network_listener() -> Result<()> {
     result?;
 
     println!(
-        "network listener smoke passed: host 127.0.0.1:{} reached guest port {} and received HTTP 200",
-        host_port, NETWORK_LISTENER_GUEST_PORT
+        "network listener smoke passed: {} concurrent host connections reached 127.0.0.1:{} -> guest port {} and received HTTP 200",
+        NETWORK_LISTENER_CONCURRENCY, host_port, NETWORK_LISTENER_GUEST_PORT
     );
     Ok(())
 }
@@ -2229,17 +2240,32 @@ fn smoke_recovery() -> Result<()> {
     let ovmf_vars = reset_security_ovmf_vars()?;
     let data_image = persistent_data_image()?;
     let serial_log = build_dir.join("serial-recovery.log");
-    let log = launch_smoke_boot(&qemu, &ovmf, &ovmf_vars, &image, &data_image, &serial_log)?;
-    if !log.contains("system slot A rejected: KernelHashMismatch")
-        || !log.contains("system recovery fallback: active=A selected=B version=1")
-        || !log
-            .contains("kernel signature: verified=true version=1 slot=B state-gen=2 recovery=true")
-        || !log.contains("codexOS standalone kernel entered")
+    let repaired = launch_smoke_boot(&qemu, &ovmf, &ovmf_vars, &image, &data_image, &serial_log)?;
+    if !repaired.contains("system slot A rejected: KernelHashMismatch")
+        || !repaired.contains("system recovery fallback: active=A selected=B version=1")
+        || !repaired.contains(
+            "system recovery state repair: selected=B version=1 generation=3 verified=true",
+        )
+        || !repaired
+            .contains("kernel signature: verified=true version=1 slot=B state-gen=3 recovery=true")
+        || !repaired.contains("codexOS standalone kernel entered")
     {
-        bail!("recovery smoke did not boot the signed fallback slot; serial output:\n{log}");
+        bail!(
+            "recovery smoke did not persist the signed fallback slot; serial output:\n{repaired}"
+        );
+    }
+
+    let normal = launch_smoke_boot(&qemu, &ovmf, &ovmf_vars, &image, &data_image, &serial_log)?;
+    if normal.contains("system slot A rejected:")
+        || normal.contains("system recovery fallback:")
+        || !normal
+            .contains("kernel signature: verified=true version=1 slot=B state-gen=3 recovery=false")
+        || !normal.contains("codexOS standalone kernel entered")
+    {
+        bail!("recovery smoke did not reuse the persisted healthy slot; serial output:\n{normal}");
     }
     println!(
-        "recovery smoke passed: corrupted active slot A was rejected and signed slot B booted"
+        "recovery smoke passed: corrupted slot A switched persistently to signed slot B generation 3"
     );
     Ok(())
 }
@@ -2259,19 +2285,33 @@ fn smoke_boot_state_recovery() -> Result<()> {
     let ovmf_vars = reset_isolated_ovmf_vars("bootstate-recovery-ovmf-vars.fd")?;
     let data_image = persistent_data_image()?;
     let serial_log = build_dir.join("serial-bootstate-recovery.log");
-    let log = launch_smoke_boot(&qemu, &ovmf, &ovmf_vars, &image, &data_image, &serial_log)?;
-    if !log.contains("system boot-state recovery: selected=A version=1 source=signed-slot-scan")
-        || !log
-            .contains("kernel signature: verified=true version=1 slot=A state-gen=0 recovery=true")
-        || !log.contains("codexOS standalone kernel entered")
-        || !log.contains("standalone pointer polling active: device=ps2 enabled=true")
+    let repaired = launch_smoke_boot(&qemu, &ovmf, &ovmf_vars, &image, &data_image, &serial_log)?;
+    if !repaired.contains(
+        "system boot-state repair: selected=A version=1 generation=2 copies=2 verified=true",
+    ) || !repaired.contains(
+        "system boot-state recovery: selected=A version=1 source=signed-slot-scan repaired=true generation=2",
+    ) || !repaired
+        .contains("kernel signature: verified=true version=1 slot=A state-gen=2 recovery=true")
+        || !repaired.contains("codexOS standalone kernel entered")
+        || !repaired.contains("standalone pointer polling active: device=ps2 enabled=true")
     {
         bail!(
-            "boot-state recovery smoke did not recover from damaged boot-state records; serial output:\n{log}"
+            "boot-state recovery smoke did not repair damaged boot-state records; serial output:\n{repaired}"
+        );
+    }
+
+    let normal = launch_smoke_boot(&qemu, &ovmf, &ovmf_vars, &image, &data_image, &serial_log)?;
+    if normal.contains("system boot-state recovery:")
+        || !normal
+            .contains("kernel signature: verified=true version=1 slot=A state-gen=2 recovery=false")
+        || !normal.contains("codexOS standalone kernel entered")
+    {
+        bail!(
+            "boot-state recovery smoke did not persist repaired records across reboot; serial output:\n{normal}"
         );
     }
     println!(
-        "boot-state recovery smoke passed: damaged boot-state records recovered through signed slot scan"
+        "boot-state recovery smoke passed: signed slot scan repaired both records and the next boot used generation 2"
     );
     Ok(())
 }
@@ -2495,7 +2535,24 @@ fn launch_smoke_boot(
     let mut child = command
         .spawn()
         .context("starting headless QEMU smoke boot")?;
-    thread::sleep(Duration::from_secs(8));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Ok(log) = fs::read_to_string(serial_log)
+            && (log.contains("standalone keyboard polling active")
+                || log.contains("kernel security failure:")
+                || log.contains("[PANIC]"))
+        {
+            break;
+        }
+        if child
+            .try_wait()
+            .context("checking headless QEMU smoke boot status")?
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     let _ = child.kill();
     let _ = child.wait();
     fs::read_to_string(serial_log).with_context(|| format!("reading {}", serial_log.display()))
@@ -2531,51 +2588,36 @@ fn wait_for_serial_log(path: &Path, needle: &str, timeout: Duration) -> Result<S
     )
 }
 
-fn probe_kernel_http_listener(host_port: u16) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(25);
-    let mut last_error: Option<anyhow::Error> = None;
-    while Instant::now() < deadline {
-        match TcpStream::connect(("127.0.0.1", host_port)) {
-            Ok(mut stream) => {
-                let attempt = (|| {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .context("setting listener probe read timeout")?;
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(3)))
-                        .context("setting listener probe write timeout")?;
-                    stream
-                        .write_all(
-                            b"GET / HTTP/1.1\r\nHost: codexos.local\r\nConnection: close\r\n\r\n",
-                        )
-                        .context("writing HTTP request to kernel listener")?;
-                    stream
-                        .shutdown(std::net::Shutdown::Write)
-                        .context("closing listener probe request stream")?;
-                    let mut response = String::new();
-                    stream
-                        .read_to_string(&mut response)
-                        .context("reading HTTP response from kernel listener")?;
-                    Ok(response)
-                })();
-                match attempt {
-                    Ok(response) => return Ok(response),
-                    Err(error) => {
-                        last_error = Some(error);
-                        thread::sleep(Duration::from_millis(250));
-                    }
-                }
-            }
-            Err(error) => {
-                last_error = Some(error.into());
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
+fn probe_kernel_http_listener_concurrent(host_port: u16, count: usize) -> Result<Vec<String>> {
+    let address = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, host_port);
+    let mut streams = Vec::with_capacity(count);
+    for index in 0..count {
+        let stream = TcpStream::connect_timeout(&address.into(), Duration::from_secs(5))
+            .with_context(|| format!("establishing concurrent listener connection {index}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .context("setting concurrent listener read timeout")?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .context("setting concurrent listener write timeout")?;
+        streams.push(stream);
     }
-    match last_error {
-        Some(error) => Err(error).context("connecting to forwarded kernel listener"),
-        None => bail!("connecting to forwarded kernel listener timed out"),
+
+    for stream in &mut streams {
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: codexos.local\r\nConnection: close\r\n\r\n")
+            .context("writing concurrent HTTP request to kernel listener")?;
     }
+
+    let mut responses = Vec::with_capacity(count);
+    for mut stream in streams {
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .context("reading concurrent HTTP response from kernel listener")?;
+        responses.push(response);
+    }
+    Ok(responses)
 }
 
 fn connect_hmp_monitor(port: u16) -> Result<TcpStream> {
@@ -2919,12 +2961,16 @@ fn validate_network_log(log: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_network_listener_log(log: &str) -> Result<()> {
+fn validate_network_listener_log(log: &str, minimum_connections: usize) -> Result<()> {
     let ready = log
         .lines()
         .find(|line| line.contains("network tcp listener ready:"))
         .context("serial log omitted the TCP listener readiness report")?;
-    if !ready.contains("port=8080") || !ready.contains("protocol=http") {
+    if !ready.contains("port=8080")
+        || !ready.contains("protocol=http")
+        || !ready.contains("capacity=8")
+        || !ready.contains("idle-timeout-ticks=3000")
+    {
         bail!("TCP listener readiness report was incomplete: {ready}");
     }
 
@@ -2948,8 +2994,22 @@ fn validate_network_listener_log(log: &str) -> Result<()> {
     let request_bytes = parse_log_usize_field(served, "request-bytes=")?;
     let response_bytes = parse_log_usize_field(served, "response-bytes=")?;
     let connections = parse_log_usize_field(served, "connections=")?;
-    if request_bytes < 16 || response_bytes < 64 || connections == 0 {
+    if request_bytes < 16 || response_bytes < 64 || connections < minimum_connections {
         bail!("TCP listener served report did not prove an HTTP exchange: {served}");
+    }
+    Ok(())
+}
+
+fn validate_network_listener_closure_log(log: &str, expected_total: usize) -> Result<()> {
+    let closed = log
+        .lines()
+        .rev()
+        .find(|line| line.contains("tcp listener closed:"))
+        .context("serial log omitted the TCP listener close report")?;
+    let count = parse_log_usize_field(closed, "count=")?;
+    let total = parse_log_usize_field(closed, "total=")?;
+    if count == 0 || total != expected_total {
+        bail!("TCP listener did not complete every client close handshake: {closed}");
     }
     Ok(())
 }

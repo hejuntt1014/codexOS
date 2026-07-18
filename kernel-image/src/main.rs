@@ -394,8 +394,10 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             network.received_frames
         );
         kernel::serial_println!(
-            "network tcp listener ready: port={} protocol=http tx={} rx={}",
+            "network tcp listener ready: port={} protocol=http capacity={} idle-timeout-ticks={} tx={} rx={}",
             kernel::network::TCP_LISTENER_PORT,
+            kernel::network::TCP_LISTENER_CAPACITY,
+            kernel::network::TCP_LISTENER_IDLE_TIMEOUT_TICKS,
             network.transmitted_frames,
             network.received_frames
         );
@@ -504,6 +506,20 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         match network_interface.poll() {
             Ok(result) => {
                 received_input |= result.received_frame;
+                if result.expired_tcp_connections != 0 {
+                    kernel::serial_println!(
+                        "tcp listener expired: count={} idle-timeout-ticks={}",
+                        result.expired_tcp_connections,
+                        kernel::network::TCP_LISTENER_IDLE_TIMEOUT_TICKS
+                    );
+                }
+                if result.closed_tcp_connections != 0 {
+                    kernel::serial_println!(
+                        "tcp listener closed: count={} total={}",
+                        result.closed_tcp_connections,
+                        result.total_closed_tcp_connections
+                    );
+                }
                 if let Some(event) = result.tcp_server {
                     let network = network_interface.report();
                     match event.kind {

@@ -482,6 +482,8 @@ fn log_boot_context(boot_info: &BootInfo) {
 enum KernelLoadError {
     FileSystemUnavailable,
     BootStateUnavailable,
+    BootStateRepairFailed,
+    BootStateGenerationExhausted,
     InvalidPath,
     KernelReadFailed,
     ManifestReadFailed,
@@ -577,7 +579,6 @@ fn load_kernel_image() -> Result<KernelImageInfo, KernelLoadError> {
     let fallback = state.active_slot.other();
     match load_system_slot(&mut fs, fallback) {
         Ok(mut image) => {
-            image.boot_state_generation = state.generation;
             image.system_slot = fallback.as_u8();
             image.recovery_fallback = 1;
             log_line(format_args!(
@@ -586,6 +587,27 @@ fn load_kernel_image() -> Result<KernelImageInfo, KernelLoadError> {
                 fallback.as_str(),
                 image.release_version
             ));
+            match persist_fallback_boot_state(&mut fs, state, fallback, image.release_version) {
+                Ok(repaired) => {
+                    image.boot_state_generation = repaired.generation;
+                    log_line(format_args!(
+                        "system recovery state repair: selected={} version={} generation={} verified=true",
+                        fallback.as_str(),
+                        image.release_version,
+                        repaired.generation
+                    ));
+                }
+                Err(error) => {
+                    image.boot_state_generation = state.generation;
+                    log_line(format_args!(
+                        "system recovery state repair: selected={} version={} generation={} verified=false error={:?}",
+                        fallback.as_str(),
+                        image.release_version,
+                        state.generation,
+                        error
+                    ));
+                }
+            }
             Ok(image)
         }
         Err(error) => {
@@ -624,15 +646,95 @@ fn recover_from_missing_boot_state(
     let Some((slot, mut image)) = selected else {
         return Err(KernelLoadError::BothSystemSlotsUnavailable);
     };
-    image.boot_state_generation = 0;
     image.system_slot = slot.as_u8();
     image.recovery_fallback = 1;
-    log_line(format_args!(
-        "system boot-state recovery: selected={} version={} source=signed-slot-scan",
-        slot.as_str(),
-        image.release_version
-    ));
+    match repair_boot_state(fs, slot, image.release_version) {
+        Ok(state) => {
+            image.boot_state_generation = state.generation;
+            log_line(format_args!(
+                "system boot-state recovery: selected={} version={} source=signed-slot-scan repaired=true generation={}",
+                slot.as_str(),
+                image.release_version,
+                state.generation
+            ));
+        }
+        Err(error) => {
+            image.boot_state_generation = 0;
+            log_line(format_args!(
+                "system boot-state recovery: selected={} version={} source=signed-slot-scan repaired=false error={:?}",
+                slot.as_str(),
+                image.release_version,
+                error
+            ));
+        }
+    }
     Ok(image)
+}
+
+fn repair_boot_state(
+    fs: &mut FileSystem,
+    slot: SystemSlot,
+    release_version: u64,
+) -> Result<BootState, KernelLoadError> {
+    let first = BootState {
+        generation: 1,
+        active_slot: slot,
+        active_release_version: release_version,
+    };
+    let second = BootState {
+        generation: 2,
+        ..first
+    };
+    for (path, state) in [("\\BOOTSTA0.BIN", first), ("\\BOOTSTA1.BIN", second)] {
+        write_verified_boot_state(fs, path, state)?;
+    }
+    log_line(format_args!(
+        "system boot-state repair: selected={} version={} generation=2 copies=2 verified=true",
+        slot.as_str(),
+        release_version
+    ));
+    Ok(second)
+}
+
+fn persist_fallback_boot_state(
+    fs: &mut FileSystem,
+    current: BootState,
+    fallback: SystemSlot,
+    release_version: u64,
+) -> Result<BootState, KernelLoadError> {
+    let generation = current
+        .generation
+        .checked_add(1)
+        .ok_or(KernelLoadError::BootStateGenerationExhausted)?;
+    let repaired = BootState {
+        generation,
+        active_slot: fallback,
+        active_release_version: release_version,
+    };
+    let path = if generation & 1 == 1 {
+        "\\BOOTSTA0.BIN"
+    } else {
+        "\\BOOTSTA1.BIN"
+    };
+    write_verified_boot_state(fs, path, repaired)?;
+    Ok(repaired)
+}
+
+fn write_verified_boot_state(
+    fs: &mut FileSystem,
+    path: &str,
+    state: BootState,
+) -> Result<(), KernelLoadError> {
+    let path = CString16::try_from(path).map_err(|_| KernelLoadError::InvalidPath)?;
+    fs.write(path.as_ref(), state.encode())
+        .map_err(|_| KernelLoadError::BootStateRepairFailed)?;
+    let bytes = fs
+        .read(path.as_ref())
+        .map_err(|_| KernelLoadError::BootStateRepairFailed)?;
+    if BootState::decode(&bytes).ok() != Some(state) {
+        return Err(KernelLoadError::BootStateRepairFailed);
+    }
+    Ok(())
 }
 
 fn load_boot_state(fs: &mut FileSystem) -> Result<BootState, KernelLoadError> {

@@ -44,6 +44,8 @@ const DNS_QUERY_NAME: &str = "example.com";
 const HTTP_CLIENT_PORT: u16 = 49153;
 const HTTP_SERVER_PORT: u16 = 80;
 pub const TCP_LISTENER_PORT: u16 = 8080;
+pub const TCP_LISTENER_CAPACITY: usize = 8;
+pub const TCP_LISTENER_IDLE_TIMEOUT_TICKS: u64 = 3_000;
 const TCP_INITIAL_SEQUENCE: u32 = 0x4344_5801;
 const TCP_SERVER_INITIAL_SEQUENCE: u32 = 0x4344_5901;
 const TCP_FLAG_FIN: u16 = 0x01;
@@ -129,6 +131,9 @@ pub struct TcpServerEvent {
 pub struct NetworkPollResult {
     pub received_frame: bool,
     pub tcp_server: Option<TcpServerEvent>,
+    pub expired_tcp_connections: usize,
+    pub closed_tcp_connections: usize,
+    pub total_closed_tcp_connections: u64,
 }
 
 #[repr(C)]
@@ -437,12 +442,27 @@ struct IncomingTcpSegment {
 }
 
 #[derive(Clone, Copy)]
+struct TcpLocalEndpoint {
+    mac: [u8; 6],
+    address: [u8; 4],
+}
+
+#[derive(Clone, Copy)]
 struct TcpServerConnection {
     remote_mac: [u8; 6],
     remote_address: [u8; 4],
     remote_port: u16,
     remote_next: u32,
     local_next: u32,
+    phase: TcpServerPhase,
+    last_activity_tick: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpServerPhase {
+    Established,
+    FinWait1,
+    FinWait2,
 }
 
 struct TcpServerAction {
@@ -453,81 +473,92 @@ struct TcpServerAction {
 
 struct TcpListener {
     local_port: u16,
-    connection: Option<TcpServerConnection>,
+    connections: [Option<TcpServerConnection>; TCP_LISTENER_CAPACITY],
     served_connections: u64,
+    closed_connections: u64,
 }
 
 impl TcpListener {
     const fn new(local_port: u16) -> Self {
         Self {
             local_port,
-            connection: None,
+            connections: [None; TCP_LISTENER_CAPACITY],
             served_connections: 0,
+            closed_connections: 0,
         }
     }
 
+    #[cfg(test)]
     fn handle_frame(
         &mut self,
         frame: &[u8],
         local_mac: [u8; 6],
         local_address: [u8; 4],
     ) -> Result<Option<TcpServerAction>, NetworkError> {
+        self.handle_frame_at(frame, local_mac, local_address, 0)
+    }
+
+    fn handle_frame_at(
+        &mut self,
+        frame: &[u8],
+        local_mac: [u8; 6],
+        local_address: [u8; 4],
+        now_tick: u64,
+    ) -> Result<Option<TcpServerAction>, NetworkError> {
         let incoming =
             parse_tcp_listener_segment(frame, local_mac, local_address, self.local_port)?;
+        let connection_index = self.connection_index(&incoming);
         if incoming.segment.flags & TCP_FLAG_RST != 0 {
-            self.connection = None;
+            if let Some(index) = connection_index {
+                self.connections[index] = None;
+            }
             return Ok(None);
         }
 
         if incoming.segment.flags & TCP_FLAG_SYN != 0 {
             return self
-                .accept_syn(incoming, local_mac, local_address)
+                .accept_syn(incoming, local_mac, local_address, now_tick)
                 .map(Some);
         }
 
-        let Some(connection) = self.connection else {
+        let Some(connection_index) = connection_index else {
             return self.reset(incoming, local_mac, local_address).map(Some);
         };
-        if connection.remote_address != incoming.remote_address
-            || connection.remote_port != incoming.remote_port
-            || connection.remote_mac != incoming.remote_mac
-        {
+        let Some(connection) = self.connections[connection_index] else {
             return Ok(None);
-        }
-        if incoming.segment.acknowledgement != connection.local_next {
-            return Ok(None);
-        }
+        };
         if incoming.segment.payload_len == 0 {
-            if incoming.segment.flags & TCP_FLAG_FIN != 0 {
-                self.connection = None;
-                return build_tcp_ipv4_frame(TcpFrameRequest {
-                    source_mac: local_mac,
-                    destination_mac: connection.remote_mac,
-                    source_address: local_address,
-                    destination_address: connection.remote_address,
-                    source_port: self.local_port,
-                    destination_port: connection.remote_port,
-                    sequence: connection.local_next,
-                    acknowledgement: incoming.segment.sequence.wrapping_add(1),
-                    flags: TCP_FLAG_ACK,
-                    payload: &[],
-                })
-                .map(|(frame, length)| {
-                    Some(TcpServerAction {
-                        frame,
-                        length,
-                        event: None,
-                    })
-                });
-            }
-            return Ok(None);
-        }
-        if incoming.segment.sequence != connection.remote_next {
-            return Ok(None);
+            return self.handle_control_segment(
+                connection_index,
+                connection,
+                incoming,
+                local_mac,
+                local_address,
+                now_tick,
+            );
         }
         let payload = &frame[incoming.segment.payload_offset
             ..incoming.segment.payload_offset + incoming.segment.payload_len];
+        if connection.phase != TcpServerPhase::Established {
+            return self.retransmit_response(
+                connection_index,
+                connection,
+                incoming,
+                payload,
+                TcpLocalEndpoint {
+                    mac: local_mac,
+                    address: local_address,
+                },
+                now_tick,
+            );
+        }
+        if incoming.segment.acknowledgement != connection.local_next
+            || incoming.segment.sequence != connection.remote_next
+        {
+            return Ok(None);
+        }
         if !is_supported_listener_request(payload) {
+            self.connections[connection_index] = None;
             return self.reset(incoming, local_mac, local_address).map(Some);
         }
         let remote_next = connection
@@ -546,7 +577,16 @@ impl TcpListener {
             flags: TCP_FLAG_PSH | TCP_FLAG_ACK | TCP_FLAG_FIN,
             payload: HTTP_LISTENER_RESPONSE,
         })?;
-        self.connection = None;
+        self.connections[connection_index] = Some(TcpServerConnection {
+            remote_next,
+            local_next: connection
+                .local_next
+                .wrapping_add(HTTP_LISTENER_RESPONSE.len() as u32)
+                .wrapping_add(1),
+            phase: TcpServerPhase::FinWait1,
+            last_activity_tick: now_tick,
+            ..connection
+        });
         self.served_connections = self.served_connections.saturating_add(1);
         Ok(Some(TcpServerAction {
             frame: reply,
@@ -568,7 +608,15 @@ impl TcpListener {
         incoming: IncomingTcpSegment,
         local_mac: [u8; 6],
         local_address: [u8; 4],
+        now_tick: u64,
     ) -> Result<TcpServerAction, NetworkError> {
+        let Some(connection_index) = self.connection_index(&incoming).or_else(|| {
+            self.connections
+                .iter()
+                .position(core::option::Option::is_none)
+        }) else {
+            return self.reset(incoming, local_mac, local_address);
+        };
         let server_sequence = tcp_server_sequence(incoming.remote_address, incoming.remote_port);
         let remote_next = incoming.segment.sequence.wrapping_add(1);
         let (reply, length) = build_tcp_ipv4_frame(TcpFrameRequest {
@@ -583,12 +631,14 @@ impl TcpListener {
             flags: TCP_FLAG_SYN | TCP_FLAG_ACK,
             payload: &[],
         })?;
-        self.connection = Some(TcpServerConnection {
+        self.connections[connection_index] = Some(TcpServerConnection {
             remote_mac: incoming.remote_mac,
             remote_address: incoming.remote_address,
             remote_port: incoming.remote_port,
             remote_next,
             local_next: server_sequence.wrapping_add(1),
+            phase: TcpServerPhase::Established,
+            last_activity_tick: now_tick,
         });
         Ok(TcpServerAction {
             frame: reply,
@@ -606,12 +656,11 @@ impl TcpListener {
     }
 
     fn reset(
-        &mut self,
+        &self,
         incoming: IncomingTcpSegment,
         local_mac: [u8; 6],
         local_address: [u8; 4],
     ) -> Result<TcpServerAction, NetworkError> {
-        self.connection = None;
         let acknowledgement = incoming
             .segment
             .sequence
@@ -635,6 +684,119 @@ impl TcpListener {
             length,
             event: None,
         })
+    }
+
+    fn connection_index(&self, incoming: &IncomingTcpSegment) -> Option<usize> {
+        self.connections.iter().position(|entry| {
+            entry.is_some_and(|connection| {
+                connection.remote_address == incoming.remote_address
+                    && connection.remote_port == incoming.remote_port
+                    && connection.remote_mac == incoming.remote_mac
+            })
+        })
+    }
+
+    fn handle_control_segment(
+        &mut self,
+        connection_index: usize,
+        mut connection: TcpServerConnection,
+        incoming: IncomingTcpSegment,
+        local_mac: [u8; 6],
+        local_address: [u8; 4],
+        now_tick: u64,
+    ) -> Result<Option<TcpServerAction>, NetworkError> {
+        if incoming.segment.flags & TCP_FLAG_ACK == 0
+            || incoming.segment.acknowledgement != connection.local_next
+            || incoming.segment.sequence != connection.remote_next
+        {
+            return Ok(None);
+        }
+        connection.last_activity_tick = now_tick;
+        if incoming.segment.flags & TCP_FLAG_FIN != 0 {
+            connection.remote_next = connection.remote_next.wrapping_add(1);
+            self.connections[connection_index] = None;
+            self.closed_connections = self.closed_connections.saturating_add(1);
+            return build_tcp_ipv4_frame(TcpFrameRequest {
+                source_mac: local_mac,
+                destination_mac: connection.remote_mac,
+                source_address: local_address,
+                destination_address: connection.remote_address,
+                source_port: self.local_port,
+                destination_port: connection.remote_port,
+                sequence: connection.local_next,
+                acknowledgement: connection.remote_next,
+                flags: TCP_FLAG_ACK,
+                payload: &[],
+            })
+            .map(|(frame, length)| {
+                Some(TcpServerAction {
+                    frame,
+                    length,
+                    event: None,
+                })
+            });
+        }
+        if connection.phase == TcpServerPhase::FinWait1 {
+            connection.phase = TcpServerPhase::FinWait2;
+        }
+        self.connections[connection_index] = Some(connection);
+        Ok(None)
+    }
+
+    fn retransmit_response(
+        &mut self,
+        connection_index: usize,
+        mut connection: TcpServerConnection,
+        incoming: IncomingTcpSegment,
+        payload: &[u8],
+        local: TcpLocalEndpoint,
+        now_tick: u64,
+    ) -> Result<Option<TcpServerAction>, NetworkError> {
+        let remote_span = (incoming.segment.payload_len as u32)
+            .wrapping_add(u32::from(incoming.segment.flags & TCP_FLAG_FIN != 0));
+        let request_sequence = connection.remote_next.wrapping_sub(remote_span);
+        let response_sequence = connection
+            .local_next
+            .wrapping_sub(HTTP_LISTENER_RESPONSE.len() as u32)
+            .wrapping_sub(1);
+        if !is_supported_listener_request(payload)
+            || incoming.segment.sequence != request_sequence
+            || incoming.segment.acknowledgement != response_sequence
+        {
+            return Ok(None);
+        }
+        let (frame, length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: local.mac,
+            destination_mac: connection.remote_mac,
+            source_address: local.address,
+            destination_address: connection.remote_address,
+            source_port: self.local_port,
+            destination_port: connection.remote_port,
+            sequence: response_sequence,
+            acknowledgement: connection.remote_next,
+            flags: TCP_FLAG_PSH | TCP_FLAG_ACK | TCP_FLAG_FIN,
+            payload: HTTP_LISTENER_RESPONSE,
+        })?;
+        connection.last_activity_tick = now_tick;
+        self.connections[connection_index] = Some(connection);
+        Ok(Some(TcpServerAction {
+            frame,
+            length,
+            event: None,
+        }))
+    }
+
+    fn expire_idle_connections(&mut self, now_tick: u64) -> usize {
+        let mut expired = 0;
+        for connection in &mut self.connections {
+            if connection.is_some_and(|entry| {
+                now_tick.saturating_sub(entry.last_activity_tick) >= TCP_LISTENER_IDLE_TIMEOUT_TICKS
+            }) {
+                *connection = None;
+                expired += 1;
+            }
+        }
+        expired
     }
 }
 
@@ -688,9 +850,14 @@ impl NetworkInterface {
 
     pub fn poll(&mut self) -> Result<NetworkPollResult, NetworkError> {
         let mut frame = [0_u8; MAX_ETHERNET_FRAME];
+        let now_tick = crate::interrupts::status().ticks;
+        let closed_before = self.tcp_listener.closed_connections;
         let mut result = NetworkPollResult {
             received_frame: false,
             tcp_server: None,
+            expired_tcp_connections: self.tcp_listener.expire_idle_connections(now_tick),
+            closed_tcp_connections: 0,
+            total_closed_tcp_connections: closed_before,
         };
         for _ in 0..32 {
             let Some(length) = self.device.try_receive(&mut frame)? else {
@@ -705,10 +872,12 @@ impl NetworkInterface {
             {
                 self.device.transmit(&reply[..reply_length])?;
             } else {
-                match self
-                    .tcp_listener
-                    .handle_frame(frame, self.device.mac, self.lease.address)
-                {
+                match self.tcp_listener.handle_frame_at(
+                    frame,
+                    self.device.mac,
+                    self.lease.address,
+                    now_tick,
+                ) {
                     Ok(Some(action)) => {
                         self.device.transmit(&action.frame[..action.length])?;
                         if let Some(event) = action.event
@@ -723,6 +892,13 @@ impl NetworkInterface {
                 }
             }
         }
+        result.total_closed_tcp_connections = self.tcp_listener.closed_connections;
+        result.closed_tcp_connections = usize::try_from(
+            result
+                .total_closed_tcp_connections
+                .saturating_sub(closed_before),
+        )
+        .unwrap_or(usize::MAX);
         Ok(result)
     }
 }
@@ -2444,6 +2620,387 @@ mod tests {
             ..response_segment.payload_offset + response_segment.payload_len];
         assert_eq!(parse_http_status(payload), Some(200));
         assert!(payload.ends_with(b"codexOS listener online\n"));
+    }
+
+    #[test]
+    fn tcp_listener_keeps_concurrent_peers_isolated() {
+        let local_mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        let remote_mac = [0x52, 0x55, 10, 0, 2, 2];
+        let local_address = [10, 0, 2, 15];
+        let remote_address = [10, 0, 2, 2];
+        let mut listener = TcpListener::new(TCP_LISTENER_PORT);
+        let first = complete_listener_handshake(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            55000,
+            0x1020_3040,
+        );
+        let second = complete_listener_handshake(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            55001,
+            0x5060_7080,
+        );
+        assert_eq!(
+            listener
+                .connections
+                .iter()
+                .filter(|connection| connection.is_some())
+                .count(),
+            2
+        );
+
+        let first_event = send_listener_request(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            55000,
+            first,
+        );
+        assert_eq!(first_event.connection_count, 1);
+        assert!(
+            listener
+                .connections
+                .iter()
+                .any(|entry| { entry.is_some_and(|connection| connection.remote_port == 55001) })
+        );
+
+        let second_event = send_listener_request(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            55001,
+            second,
+        );
+        assert_eq!(second_event.connection_count, 2);
+        assert_eq!(
+            listener
+                .connections
+                .iter()
+                .filter(|connection| connection.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            listener
+                .connections
+                .iter()
+                .flatten()
+                .all(|connection| { connection.phase == TcpServerPhase::FinWait1 })
+        );
+    }
+
+    #[test]
+    fn tcp_listener_retransmits_response_and_completes_fin_handshake() {
+        let local_mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        let remote_mac = [0x52, 0x55, 10, 0, 2, 2];
+        let local_address = [10, 0, 2, 15];
+        let remote_address = [10, 0, 2, 2];
+        let remote_port = 55000;
+        let mut listener = TcpListener::new(TCP_LISTENER_PORT);
+        let sequence = complete_listener_handshake(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            remote_port,
+            0x1020_3040,
+        );
+        let response = send_listener_request_action(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            remote_port,
+            sequence,
+        );
+        assert_eq!(response.event.unwrap().connection_count, 1);
+        let retransmission = send_listener_request_action(
+            &mut listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            remote_port,
+            sequence,
+        );
+        assert!(retransmission.event.is_none());
+        assert_eq!(
+            &response.frame[..response.length],
+            &retransmission.frame[..retransmission.length]
+        );
+        assert_eq!(listener.served_connections, 1);
+
+        let connection_index = listener
+            .connections
+            .iter()
+            .position(Option::is_some)
+            .unwrap();
+        let connection = listener.connections[connection_index].unwrap();
+        assert_eq!(connection.phase, TcpServerPhase::FinWait1);
+        let (fin_ack, fin_ack_length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: remote_mac,
+            destination_mac: local_mac,
+            source_address: remote_address,
+            destination_address: local_address,
+            source_port: remote_port,
+            destination_port: TCP_LISTENER_PORT,
+            sequence: connection.remote_next,
+            acknowledgement: connection.local_next,
+            flags: TCP_FLAG_ACK,
+            payload: &[],
+        })
+        .unwrap();
+        assert!(
+            listener
+                .handle_frame(&fin_ack[..fin_ack_length], local_mac, local_address)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            listener.connections[connection_index].unwrap().phase,
+            TcpServerPhase::FinWait2
+        );
+
+        let (fin, fin_length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: remote_mac,
+            destination_mac: local_mac,
+            source_address: remote_address,
+            destination_address: local_address,
+            source_port: remote_port,
+            destination_port: TCP_LISTENER_PORT,
+            sequence: connection.remote_next,
+            acknowledgement: connection.local_next,
+            flags: TCP_FLAG_FIN | TCP_FLAG_ACK,
+            payload: &[],
+        })
+        .unwrap();
+        let final_ack = listener
+            .handle_frame(&fin[..fin_length], local_mac, local_address)
+            .unwrap()
+            .unwrap();
+        let final_ack_segment = parse_tcp_segment(
+            &final_ack.frame[..final_ack.length],
+            local_mac,
+            remote_address,
+            local_address,
+            remote_port,
+            TCP_LISTENER_PORT,
+        )
+        .unwrap();
+        assert_eq!(final_ack_segment.flags, TCP_FLAG_ACK);
+        assert_eq!(
+            final_ack_segment.acknowledgement,
+            connection.remote_next.wrapping_add(1)
+        );
+        assert!(listener.connections[connection_index].is_none());
+        assert_eq!(listener.closed_connections, 1);
+    }
+
+    #[test]
+    fn tcp_listener_refuses_excess_connections_without_eviction() {
+        let local_mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        let remote_mac = [0x52, 0x55, 10, 0, 2, 2];
+        let local_address = [10, 0, 2, 15];
+        let remote_address = [10, 0, 2, 2];
+        let mut listener = TcpListener::new(TCP_LISTENER_PORT);
+        for index in 0..TCP_LISTENER_CAPACITY {
+            complete_listener_handshake(
+                &mut listener,
+                local_mac,
+                remote_mac,
+                local_address,
+                remote_address,
+                55000 + index as u16,
+                0x1020_3040 + index as u32 * 0x100,
+            );
+        }
+
+        let (syn, syn_length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: remote_mac,
+            destination_mac: local_mac,
+            source_address: remote_address,
+            destination_address: local_address,
+            source_port: 56000,
+            destination_port: TCP_LISTENER_PORT,
+            sequence: 0x90a0_b0c0,
+            acknowledgement: 0,
+            flags: TCP_FLAG_SYN,
+            payload: &[],
+        })
+        .unwrap();
+        let refusal = listener
+            .handle_frame(&syn[..syn_length], local_mac, local_address)
+            .unwrap()
+            .unwrap();
+        let refusal_segment = parse_tcp_segment(
+            &refusal.frame[..refusal.length],
+            local_mac,
+            remote_address,
+            local_address,
+            56000,
+            TCP_LISTENER_PORT,
+        )
+        .unwrap();
+        assert_eq!(
+            refusal_segment.flags & (TCP_FLAG_RST | TCP_FLAG_ACK),
+            TCP_FLAG_RST | TCP_FLAG_ACK
+        );
+        assert_eq!(
+            listener
+                .connections
+                .iter()
+                .filter(|connection| connection.is_some())
+                .count(),
+            TCP_LISTENER_CAPACITY
+        );
+        assert!(
+            listener
+                .connections
+                .iter()
+                .any(|entry| { entry.is_some_and(|connection| connection.remote_port == 55000) })
+        );
+        assert_eq!(
+            listener.expire_idle_connections(TCP_LISTENER_IDLE_TIMEOUT_TICKS - 1),
+            0
+        );
+        assert_eq!(
+            listener.expire_idle_connections(TCP_LISTENER_IDLE_TIMEOUT_TICKS),
+            TCP_LISTENER_CAPACITY
+        );
+        let accepted = listener
+            .handle_frame_at(
+                &syn[..syn_length],
+                local_mac,
+                local_address,
+                TCP_LISTENER_IDLE_TIMEOUT_TICKS,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.event.unwrap().kind, TcpServerEventKind::Accepted);
+    }
+
+    fn complete_listener_handshake(
+        listener: &mut TcpListener,
+        local_mac: [u8; 6],
+        remote_mac: [u8; 6],
+        local_address: [u8; 4],
+        remote_address: [u8; 4],
+        remote_port: u16,
+        remote_sequence: u32,
+    ) -> (u32, u32) {
+        let (syn, syn_length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: remote_mac,
+            destination_mac: local_mac,
+            source_address: remote_address,
+            destination_address: local_address,
+            source_port: remote_port,
+            destination_port: TCP_LISTENER_PORT,
+            sequence: remote_sequence,
+            acknowledgement: 0,
+            flags: TCP_FLAG_SYN,
+            payload: &[],
+        })
+        .unwrap();
+        let syn_ack = listener
+            .handle_frame(&syn[..syn_length], local_mac, local_address)
+            .unwrap()
+            .unwrap();
+        assert_eq!(syn_ack.event.unwrap().kind, TcpServerEventKind::Accepted);
+        let syn_ack_segment = parse_tcp_segment(
+            &syn_ack.frame[..syn_ack.length],
+            local_mac,
+            remote_address,
+            local_address,
+            remote_port,
+            TCP_LISTENER_PORT,
+        )
+        .unwrap();
+        let client_next = remote_sequence.wrapping_add(1);
+        let server_next = syn_ack_segment.sequence.wrapping_add(1);
+        let (ack, ack_length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: remote_mac,
+            destination_mac: local_mac,
+            source_address: remote_address,
+            destination_address: local_address,
+            source_port: remote_port,
+            destination_port: TCP_LISTENER_PORT,
+            sequence: client_next,
+            acknowledgement: server_next,
+            flags: TCP_FLAG_ACK,
+            payload: &[],
+        })
+        .unwrap();
+        assert!(
+            listener
+                .handle_frame(&ack[..ack_length], local_mac, local_address)
+                .unwrap()
+                .is_none()
+        );
+        (client_next, server_next)
+    }
+
+    fn send_listener_request(
+        listener: &mut TcpListener,
+        local_mac: [u8; 6],
+        remote_mac: [u8; 6],
+        local_address: [u8; 4],
+        remote_address: [u8; 4],
+        remote_port: u16,
+        sequence: (u32, u32),
+    ) -> TcpServerEvent {
+        send_listener_request_action(
+            listener,
+            local_mac,
+            remote_mac,
+            local_address,
+            remote_address,
+            remote_port,
+            sequence,
+        )
+        .event
+        .unwrap()
+    }
+
+    fn send_listener_request_action(
+        listener: &mut TcpListener,
+        local_mac: [u8; 6],
+        remote_mac: [u8; 6],
+        local_address: [u8; 4],
+        remote_address: [u8; 4],
+        remote_port: u16,
+        sequence: (u32, u32),
+    ) -> TcpServerAction {
+        let request = b"GET / HTTP/1.1\r\nHost: codexos.local\r\nConnection: close\r\n\r\n";
+        let (frame, length) = build_tcp_ipv4_frame(TcpFrameRequest {
+            source_mac: remote_mac,
+            destination_mac: local_mac,
+            source_address: remote_address,
+            destination_address: local_address,
+            source_port: remote_port,
+            destination_port: TCP_LISTENER_PORT,
+            sequence: sequence.0,
+            acknowledgement: sequence.1,
+            flags: TCP_FLAG_PSH | TCP_FLAG_ACK,
+            payload: request,
+        })
+        .unwrap();
+        listener
+            .handle_frame(&frame[..length], local_mac, local_address)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]

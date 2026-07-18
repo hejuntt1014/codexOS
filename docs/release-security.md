@@ -14,7 +14,7 @@ cargo xtask smoke-install
 cargo xtask smoke-gpt-install
 ```
 
-The gates respectively prove signature and rollback rejection, signed trust-root transition with old-root rejection, GPT/EFI System Partition boot, fallback-slot boot, damaged boot-state recovery through signed slot scanning, the whole-disk FAT install/update/recovery sequence, and the GPT/ESP install/update/recovery sequence.
+The gates respectively prove signature and rollback rejection, signed trust-root transition with old-root rejection, GPT/EFI System Partition boot, fallback-slot boot, damaged boot-state recovery with verified dual-record repair, the whole-disk FAT install/update/recovery sequence, and the GPT/ESP install/update/recovery sequence.
 
 ## Production release
 
@@ -73,4 +73,4 @@ The updater writes the inactive slot first, verifies the reread kernel and signa
 
 ## Recovery behavior
 
-At boot, the loader validates the newest usable boot-state record and the selected slot. If its manifest, hash, signature, ELF structure, or staging operation fails, the other signed slot is attempted. If both boot-state records are damaged, the loader scans the signed A/B slots and selects the highest verified release that passes the nonvolatile release floor. Recovery never authorizes an older prohibited release.
+At boot, the loader validates the newest usable boot-state record and the selected slot. If its manifest, hash, signature, ELF structure, or staging operation fails, the other signed slot is attempted. After a verified fallback succeeds, the loader advances the alternate boot-state record to select that healthy slot and rereads the record before chainloading; later boots use the healthy slot directly. If both boot-state records are damaged, the loader scans the signed A/B slots, selects the highest verified release that passes the nonvolatile release floor, writes generations 1 and 2 in sequence, and rereads each copy before chainloading. Recovery never authorizes an older prohibited release.

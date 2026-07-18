@@ -33,10 +33,11 @@ cargo xtask smoke-gpt-install
 `cargo xtask smoke` runs QEMU headlessly for a few seconds and verifies the serial log automatically.
 `cargo xtask smoke-handoff` verifies the post-`ExitBootServices` path and checks for `boot mode: post-exit-boot-services`.
 `cargo xtask smoke-chainload` verifies the resident kernel handoff, page-table ownership, reserved heap initialization, Ring 3 syscalls and isolation faults, PIT-preemptive multi-process scheduling, timed sleep/wakeup, low-power idle entry, address-space reclamation, SHA-256 verified ELF64 execution from CodexFS, directory metadata migration, dynamic multi-sector CodexFS file commits, desktop rendering, two-boot persistence continuity, DHCP configuration, ARP gateway resolution, DNS A-record resolution, TCP three-way handshake plus HTTP response, a TCP/HTTP listener being armed, and an ICMP echo exchange.
-`cargo xtask smoke-network-listener` starts QEMU with a temporary host TCP port forwarded to guest port `8080`, sends a real HTTP request from the host, requires an HTTP 200 response from the kernel, and checks the kernel's served-connection serial report.
+`cargo xtask smoke-network-listener` starts QEMU with a temporary host TCP port forwarded to guest port `8080`, completes four host TCP handshakes before sending any request, requires all four connections to receive HTTP 200 responses, and requires the kernel to report both four served connections and four completed client close handshakes.
 `cargo xtask smoke-pointer-input` starts QEMU with a TCP monitor, waits for the resident PS/2 pointer driver to enable streaming, injects a mouse movement, and requires the kernel serial event to report nonzero motion.
 `cargo xtask smoke-gpt-esp` builds a protective-MBR/GPT disk, validates primary and backup GPT CRCs plus the EFI System Partition contents, then boots it through OVMF.
-`cargo xtask smoke-bootstate-recovery` damages both boot-state records, then requires the loader to scan signed system slots and boot a verified recovery path.
+`cargo xtask smoke-recovery` corrupts active slot A, requires the first boot to verify slot B and persist generation 3 selecting B, then cold-boots again and requires a direct normal boot from B without retrying A.
+`cargo xtask smoke-bootstate-recovery` damages both boot-state records, requires the loader to scan signed system slots and rebuild both records, then cold-boots again and requires a normal generation-2 boot.
 `cargo xtask smoke-gpt-install` installs a GPT/ESP image, applies a signed offline update through the installed ESP, boots the new slot, corrupts that slot, and proves signed fallback from the other slot.
 
 ## Current debug signals
@@ -72,8 +73,10 @@ cargo xtask smoke-gpt-install
 - Serial line `network configured: ipv4=...` reports the validated DHCP lease, subnet, gateway, DHCP server, DNS server, and bidirectional frame counts.
 - Serial line `dns resolved: name=example.com ... answer=... query-id=0x4344` proves a checksummed UDP DNS A-record query completed through the configured resolver.
 - Serial line `tcp http verified: host=example.com ... status=... bytes=... source-port=49153` proves a TCP active open, HTTP request, checksummed response, and final ACK completed through QEMU networking.
-- Serial line `network tcp listener ready: port=8080 protocol=http ...` proves the runtime TCP listener is armed after DHCP, DNS, ICMP, and active HTTP verification.
+- Serial line `network tcp listener ready: port=8080 protocol=http capacity=8 idle-timeout-ticks=3000 ...` proves the bounded runtime TCP listener is armed with PIT-clocked idle reclamation after DHCP, DNS, ICMP, and active HTTP verification.
 - Serial line `tcp listener served: port=8080 remote=... request-bytes=... response-bytes=... connections=...` proves the kernel accepted a host-forwarded TCP connection and returned an HTTP response.
+- Serial line `tcp listener closed: count=... total=...` proves the kernel validated the client's final FIN, acknowledged it, and released that peer's connection slot.
+- Serial line `tcp listener expired: count=... idle-timeout-ticks=3000` records bounded reclamation of peers that did not complete their handshake or shutdown.
 - Serial line `standalone pointer polling active: device=ps2 enabled=true ...` proves the resident kernel initialized the PS/2 auxiliary mouse device after firmware services ended.
 - Serial line `pointer input event: device=ps2 dx=... dy=... left=... right=...` proves a PS/2 mouse packet reached the kernel, was decoded into screen-space motion, and was delivered to the desktop pointer path.
 - Serial lines `arp gateway verified: ...` and `icmp echo verified: ...` prove layer-2 resolution and a checksummed IPv4/ICMP round trip; the smoke gate requires network checks on each cold boot.
@@ -81,13 +84,16 @@ cargo xtask smoke-gpt-install
 - Serial line `kernel trust root: source=... activation-version=... signer-key-id=...` identifies whether the loader used its embedded bootstrap root or a persisted UEFI trust root.
 - Serial line `trust root update: activated version=... previous-source=... next-key-id=...` proves a signed release carried and persisted a replacement release-verification key.
 - Serial line `system slot X rejected: ...` records why a slot was denied before execution; `system recovery fallback: ...` records the independently verified slot selected instead.
-- Serial line `system boot-state recovery: selected=... version=... source=signed-slot-scan` proves damaged boot-state records did not prevent booting a verified signed system slot.
+- Serial line `system recovery state repair: selected=B version=... generation=3 verified=true` proves the verified fallback selection was persisted and reread before execution.
+- Serial line `system boot-state repair: selected=... version=... generation=2 copies=2 verified=true` proves the loader rebuilt and reread both damaged boot-state records.
+- Serial line `system boot-state recovery: selected=... version=... source=signed-slot-scan repaired=true generation=2` proves the repaired state came from a verified signed system slot.
 - `smoke-security` requires altered kernels, altered signatures, and signed rollback attempts to stop before `codexOS kernel entered`.
 - `smoke-trust-rotation` requires a transition release to persist the replacement trust root, a later release signed by that replacement to boot, and a higher old-root release to stop before `codexOS standalone kernel entered`.
-- `smoke-network-listener` requires QEMU host forwarding to deliver a host-originated TCP request to guest port `8080` and receive the kernel's HTTP 200 response.
+- `smoke-network-listener` requires QEMU host forwarding to hold four peer-isolated TCP connections open concurrently, deliver a request through each connection to guest port `8080`, receive four HTTP 200 responses, report `connections=4`, and complete client shutdown through `total=4`.
 - `smoke-pointer-input` requires QEMU monitor input to generate a resident PS/2 pointer packet with nonzero movement in the kernel serial log.
 - `smoke-gpt-esp` requires the disk image to contain a valid protective MBR, primary and backup GPT headers, a CRC-verified EFI System Partition entry, signed A/B kernel files inside that ESP, and a successful OVMF chainload boot.
-- `smoke-bootstate-recovery` requires both boot-state records to be damaged and the loader to recover through a signed slot with `state-gen=0 recovery=true`.
+- `smoke-recovery` requires the first cold boot to reject corrupted slot A, persist slot B as generation 3, and the second cold boot to report `slot=B state-gen=3 recovery=false` without another fallback.
+- `smoke-bootstate-recovery` requires both boot-state records to be damaged, rebuilt as generations 1 and 2, and reused on the next cold boot with `state-gen=2 recovery=false`.
 - `smoke-install` requires a full image readback hash, an inactive-slot version switch, and recovery from corruption of the newly selected slot.
 - `smoke-gpt-install` requires the same install/update/recovery proof through a GPT disk and its EFI System Partition.
 - Serial line `vm: root table at ...` confirms the kernel initialized the virtual-memory manager.
