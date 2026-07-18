@@ -9,6 +9,10 @@ The repository has a repeatable development and verification loop:
 - render a framebuffer desktop scene
 - emit serial logs for debugging
 
+## Built with Codex
+
+This project was vibe-coded end-to-end with **OpenAI Codex**. Development started on **GPT-5.4**, then moved forward with each model release through **GPT-5.5** and **GPT-5.6**. Later coding used the latest **GPT-5.6**.
+
 ## Current status
 
 The repository currently implements:
